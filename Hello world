@@ -1,4 +1,5 @@
-Hello class PnLPosTracker(ABC):
+
+class PnLPosTracker(ABC):
     def __init__(self, calendar='HKG', country_issued_code='HK', save=False, save_dir='', loadsymap=True):
         self.fut_contract_size = pd.Series({'HSI': 50, 'HCEI': 50})
         self.trd_stats_header = ['n_buy', 'n_sell', 'stk_delta_buy', 'stk_delta_sell', 'stk_delta_nettrd', 'max_buy', 'max_sell']
@@ -9,6 +10,20 @@ Hello class PnLPosTracker(ABC):
         self.save_dir = save_dir
         if loadsymap:
             self.get_symap(country_issued_code)
+
+    def get_symap(self, country_issued_code='HK'): # county_issued_code could be HK, TW, CH
+        # first, we load an in-house databased that maps between all kinds of symbols
+        # such as bloomberg code, ticker, ric, cusip, isin, sedol and etc.
+        # then we load factset database that maps between sedol and fsym_id
+        sedols = usm.getsyms(['ric_code', 'bb_composite_code', 'sedol_code'], filter="country_issued_code='{}'".format(country_issued_code))
+        sedols = sedols[~sedols.sedol_code.isnull()].copy()
+        sedols.index = sedols.ric_code.values
+        tdf = ufs.sedol2fsym(sedols.sedol_code.values)
+        tdf.index = tdf.sedol
+        sedols['fsym'] = tdf.fsym.reindex(sedols.sedol_code.values).values
+        sedols['rics'] = sedols.index.values
+        self.symap = sedols
+        self.ric2fsym = sedols.fsym
 
     @abstractmethod
     def get_trades(self, ymd):
@@ -252,3 +267,63 @@ Hello class PnLPosTracker(ABC):
         else:
             divs = pd.DataFrame(columns=['fsym_id', 'divs_exdate', 'p_divs_pd', 'currency', 'p_divs_s_spinoff', 'p_divs_s_pd', 'shares', 'total_div'])
         return divs
+
+class QMM_PnLPosTracker(PnLPosTracker):
+    def get_raw_trades(self, ymd):
+        df = uwb.get_strategy_trades(ymd, 'ATSQMM')
+        df['ymd'] = pd.to_datetime(df['ts']).dt.strftime('%Y%m%d')
+        df = pd.concat([df, manualrolltrds, ioitrades], axis=0, sort=True)
+        df['ishedge'] = self.ishedge(df.ric.values)
+        return df
+
+    def isfuture(self, rics):
+        return np.array([x[0:-2] in ('HSI', 'HCEI') for x in rics])
+
+    def ishedge(self, rics):
+        return np.array([x[0:-2] in ('HSI', 'HCEI') for x in rics])
+
+    def get_future_root(self, rics):
+        return np.array([x[0:-2] for x in rics])
+
+    def ric2bbg_futures(self, ric):
+        d = {'HSI': 'HI', 'HCEI': 'HC'}
+        return d[ric[0:-2]] + ric[-2:] + 'Index'
+
+    def gen_trd_stats(self, trddf): # overide for QMM because i want separate RA annd RM
+        if trddf.shape[0] < 1:
+            return [0] * len(self.trd_stats_header)
+        ishedge = self.ishedge(trddf.ric.values)
+        trddf = trddf[~ishedge]
+        is_omm = trddf.ric.isin(self.omm)
+        is_warrant = trddf.crosstradingaccount.isin(['DTG'])
+        is_deriv = trddf.crosstradingaccount.isin(['HKI3'])
+        bf = trddf.side.str[0] == 'B'
+        raf = trddf.algo == 'RA'
+        rmf = trddf.algo == 'RM'
+        n_buy = (bf).sum()
+        n_sell = (~bf).sum()
+        delta_buy_ra = trddf.absval[bf&raf].sum()
+        delta_sell_ra = trddf.absval[(~bf)&raf].sum()
+        delta_buy_rm = trddf.absval[bf & rmf].sum()
+        delta_sell_rm = trddf.absval[(~bf) & rmf].sum()
+        delta_net = trddf.sgnval.sum()
+        max_buy = max(trddf.absval[bf].values, default=0)
+        max_sell = max(trddf.absval[~bf].values, default=0)
+        warrant_notional = trddf.absval[raf&is_warrant].sum()
+        deriv_notional = trddf.absval[raf&is_deriv&(~is_omm)].sum()
+        warrant_notional_rm = trddf.absval[rmf & is_warrant].sum()
+        deriv_notional_rm = trddf.absval[rmf & is_deriv & (~is_omm)].sum()
+        self.trd_stats_header = ['n_buy', 'n_sell', 'stk_delta_buy_RA', 'stk_delta_sell_RA', 'stk_delta_buy_RM', 'stk_delta_sell_RM', 'stk_delta_nettrd', 'max_buy', 'max_sell', 'warrant_notional_ra', 'deriv_notional_ra', 'warrant_notional_rm', 'deriv_notional_rm']
+        return [n_buy, n_sell, delta_buy_ra, delta_sell_ra, delta_buy_rm, delta_sell_rm, delta_net, max_buy, max_sell, warrant_notional, deriv_notional, warrant_notional_rm, deriv_notional_rm]
+
+    def get_trades(self, ymd):
+        fn = '{}/{}/trades.csv'.format(self.save_dir, ymd)
+        if os.path.exists(fn):
+            trddf = pd.read_csv(fn, index_col=0)
+            if 'algo' not in trddf.columns:
+                trddf['algo'] = ''
+                trddf.loc[(trddf.sgn == 1) & (~self.ishedge(trddf.ric.values)), 'algo'] = 'RA'
+                trddf.loc[(trddf.sgn == -1) & (~self.ishedge(trddf.ric.values)), 'algo'] = 'RM'
+            else:
+                trddf = pd.DataFrame(columns=['ric', 'side', 'size', 'price', 'sgn', 'sgnsize', 'sgnval', 'absval', 'algo'])
+            return trddf
