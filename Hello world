@@ -1,39 +1,17 @@
+N = 5   # markout days
+    ndf = pd.read_csv("D:/data/CRB/enriched_trades_file.csv")
+    ynames = ['sgn_ret_{}'.format(i) for i in range(N+1)]
+    qq = np.ones(ndf.shape[0]).astype(bool)
 
-def reconcile_position(ymd):
-    pptracker = uppt.PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=False)
-    my_sod = pptracker.get_sod_position(ymd)
-    ishedge = pptracker.ishedge(my_sod.index.values)
-    my_sod.loc[ishedge, 'shares'] = my_sod.loc[ishedge, 'shares'] / 50
-    stk_sod = my_sod[(~ishedge) & (my_sod.index.values != 'cash')]
+    all = uda.summarize(ndf[qq], by=['one'], ynames=ynames, weight='absval')
+    byside = uda.summarize(ndf[qq], by=['side'], ynames=ynames, weight='absval')
 
-    # reconcile with position fetched from back office position management sysmtem
-
-def check_pnl(st, en):
-    pptracker = uppt.PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=False)
-    stats = pptracker.gen_all_stats(st, en)
-    pptracker.change_currency(stats, fxrate=7.7501)
-    return stats
-
-def pre_open_run():
-    pptracker = uppt.PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=True)
-    self = pptracker
-    ymd = pd.Timestamp.today().strftime('%Y%m%d')
-    prev_ymd = udt.getPrevTradingDay(ymd, cc='HKG')
-    print(ymd)
-    pptracker.gen_eod_trd_pos(prev_ymd)
-    pptracker.gen_sod_position(ymd)
-
-    reconcile_position(ymd)
-
-    pnl = check_pnl('20200101', prev_ymd)
-
-def fix_all_run():
-    pptracker = uppt.PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=True)
-    self = pptracker
-    ymds = [dt.strftime('%Y%m%d') for dt in udt.getTraingDays('20200101', '20201231', cc='HKG')]
-    for i in range(1, len(ymds)):
-        ymd = ymds[i]
-        prev_ymd = ymds[i-1]
-        print(ymd)
-        pptracker.gen_eod_trd_pos(prev_ymd, clsprtype='local')
-        pptracker.gen_sod_position(ymd, currency='local')
+    # note that groupby can group by a lambda function, i used that to create groups
+    # on the fly, particularly for all sample
+    # aggregation function can also be lambda function
+    aggregations = {
+        'ordervalue': [len, 'sum'],
+        'executedvalue': ['sum'],
+        'qdone': [lambda x: 1.0 - (np.sum(x > 0) / len(x))]
+    }
+    ndf.groupby(lambda x: 'ALL').agg(aggregations)
