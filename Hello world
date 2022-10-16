@@ -1,17 +1,401 @@
-N = 5   # markout days
-    ndf = pd.read_csv("D:/data/CRB/enriched_trades_file.csv")
-    ynames = ['sgn_ret_{}'.format(i) for i in range(N+1)]
-    qq = np.ones(ndf.shape[0]).astype(bool)
+import Utils.ApacDateTimeUtils as udt
+import pandas as pd
+import numpy as np
 
-    all = uda.summarize(ndf[qq], by=['one'], ynames=ynames, weight='absval')
-    byside = uda.summarize(ndf[qq], by=['side'], ynames=ynames, weight='absval')
+root_dir = 'D:/data/hsi_sweepas'
+ymd = '20191101'
+ts = np.array(list(range(int(36000 * 6.25 + 1)))) / 10   # this decide the interval size
+ts = np.array(list(range(int(3600 * 6.25 + 1))))
 
-    # note that groupby can group by a lambda function, i used that to create groups
-    # on the fly, particularly for all sample
-    # aggregation function can also be lambda function
-    aggregations = {
-        'ordervalue': [len, 'sum'],
-        'executedvalue': ['sum'],
-        'qdone': [lambda x: 1.0 - (np.sum(x > 0) / len(x))]
-    }
-    ndf.groupby(lambda x: 'ALL').agg(aggregations)
+def get_return_one_day(ymd, ric='HSIZ9'):
+    mornst = pd.to_datetime('{} 09:15:00.000000'.format(ymd))
+    mornen = pd.to_datetime('{} 12:00:00.000000'.format(ymd))
+    aftnst = pd.to_datetime('{} 13:00:00.000000'.format(ymd))
+    aftnen = pd.to_datetime('{} 16:30:00.000000'.format(ymd))
+
+    df = pd.read_csv('{}/futures/{}.{}.csv'.format(root_dir, ric, ymd))
+    df = df.apply(lambda x: x.fillna(method='ffill'))
+    df['mid'] = 0.5 * (df.BID + df.ASK)
+    df['ts'] = pd.to_datetime(df.TIMESTAMP)
+
+    q1 = (df.ts >= mornen) & (df.ts <= aftnst)
+    df = df.loc[~q1]
+    df.loc[df.ts >= aftnst, 'ts'] = df.loc[df.ts >= aftnst, 'ts'] - pd.Timedelta(hours=1.0)
+    df['sss'] = (df.ts.astype(np.int64) - mornst.value) / 1e9
+    q2 = (df.BIDSIZE > 0.5) & (df.ASKSIZE > 0.5)
+    df = df[q2]
+    df.reset_index(drop=True, inplace=True)
+    df.index = df.sss.values
+    df = df.asof(ts)
+    df['ymd'] = ymd
+    return df[['BID', 'ASK', 'mid', 'ymd']]
+
+def zstat(x):
+    return x.mean() * np.sqrt(x.shape[0]) / x.std()
+
+def sweepq():
+    if False:
+        dfs = []
+        for dt in udt.getTraingDays('20191029', '20191127'):
+            print(dt)
+            tdf = get_return_one_day(dt.strftime('%Y%m%d'), 'HSIX9')
+            dfs.append(tdf)
+        df = pd.concat(dfs, axis=0)
+        df.to_csv("D:/data/sas/hsix9_sweep.csv")
+
+    df = pd.read_csv("D:/data/sas/hsix9_sweep.csv", index_col=0)
+
+    coln = 'ASK'
+    pr = df[[coln, 'ymd']]
+    df = {}
+    db = {}
+    aggfunc = ['size', 'mean', 'std', zstat]
+    fwdhz = [1,2,5]
+    for k in [5]:
+        print(k)
+        ret = pr.groupby('ymd')[[coln]].apply(lambda x: (x.shift(-k) - x).iloc[:-k])
+        # note that i used [coln] instead of coln here to return dataframe instead of series
+        ret.columns = ['curr']
+        ret['cmax'] = pr.groupby('ymd')[[coln]].apply(lambda x: (x.rolling(window=k + 1).max().shift(-k) - x).iloc[:-k])
+        for m in fwdhz:
+            ret['intv_{}'.format(m)] = pr.groupby('ymd')[[coln]].apply(lambda x: (x.shift(-k * m - k) - x).iloc[:-k])
+        ret = ret[~ret.isnull().any(axis=1)]
+        ret = np.round(ret).astype(np.int64)
+
+        sf = []
+        sb = []
+        xs = []
+        edge = sorted(ret.curr[ret.curr >= 0].unique())
+        for x in edge:
+            print(x)
+            if (ret.cmax > x).sum() > 0:
+                pnlb = x - ret.loc[ret.cmax > x, ['intv_{}'.format(m) for m in fwdhz]]
+                sb.append(pnlb.agg(aggfunc).unstack())
+                pnlf = x - ret.loc[ret.camx >= x, ['intv_{}'.format(m) for m in fwdhz]]
+                sf.append(pnlf.agg(aggfunc).unstack())
+                xs.append(x)
+            fq = pd.concat(sf, axis=1).T
+            bq = pd.concat(sb, axis=1).T
+            fq.index = xs
+            bq.index = xs
+
+            df[k] = fq
+            db[k] = bq
+
+# for each sampling starting point, get the move in 1s, 2s, 5s, 10s, 30s, 60s
+
+def sweepq_no_overlap(): # there is no overlap in the intervals, at most one order at each time
+    df = pd.read_csv("D:/data/sas/hsix9_sweep.csv", index_col=0)
+    coln = 'ASK'
+    pr = df[[coln, 'ymd']].copy()
+
+    df = {}
+    db = {}
+    aggfunc = ['size', 'mean', 'std', zstat]
+    fwdhz = [1, 2, 5]
+    for k in [5]:  #
+        print(k)
+        pr['bkt'] = (pr.index.values - 1.0) // k + 1
+        ret = pr.groupby(['ymd', 'bkt'])['ASK'].agg(['last', 'max']).reset_index()
+        ret['prev_last'] = ret.groupby('ymd')['last'].shift()
+        ret['curr'] = ret['last'] - ret.prev_last
+        ret['cmax'] = ret['max'].values - ret.prev_last.values
+        for m in fwdhz:
+            ret['intv_{}'.format(m)] = ret.groupby('ymd')['last'].shift(-m) - ret.prev_last
+        ret = ret[~ret.isnull().any(axis=1)]
+        ret = np.round(ret).astype(np.int64)
+
+        sf = []
+        sb = []
+        xs = []
+        edge = sorted(ret.cmax[ret.cmax >= 0].unique())
+        for x in edge:
+            if (ret.cmax > x).sum() > 0:
+                pnlb = x - ret.loc[ret.cmax > x, ['intv_{}'.format(m) for m in fwdhz]]
+                sb.append(pnlb.agg(aggfunc).unstack())
+                pnlf = x - ret.loc[ret.cmax >= x, ['intv_{}'.format(m) for m in fwdhz]]
+                sf.append(pnlf.agg(aggfunc).unstack())
+                xs.append(x)
+        fq = pd.concat(sf, axis=1).T
+        bq = pd.concat(sb, axis=1).T
+        fq.index = xs
+        bq.index = xs
+
+        df[k] = fq
+        db[k] = bq
+        
+        
+        import numpy as np
+import pandas as pd
+import glob
+import zipfile
+
+# for loading data for different countries
+map_cc = {
+    'HKG': {'country_code': 'HKG', 'currency': 'HKD', 'localid_prefix': 'HK'},
+    'KOR': {'country_code': 'KOR', 'currency': 'KRW', 'localid_prefix': 'KR'},
+    'HKG': {'country_code': 'TWN', 'currency': 'TWD', 'localid_prefix': 'TW'},
+}
+
+class BarraDataLoader:
+    def __init__(self, data_ymd, data_dir, load_data=True):
+        self.data_ymd = data_ymd
+        self.data_dir = data_dir
+        self.d_txt2zip = self.find_zip(data_ymd, data_dir)
+        if not load_data:
+            return
+        self.get_universe()
+        self.get_loadings()
+        self.get_risk_data()
+        self.get_return_data()
+        self.get_asset_price()
+
+    def find_zip(self, data_ymd, data_dir):
+        """
+            show the use of glob and dictionary update
+        """
+        zipfns = glob.glob('{}/*{}*.zip'.format(data_dir, data_ymd[2:]))
+        d = {}
+        for zipfn in zipfns:
+            txtfns = zipfile.ZipFile(zipfn).namelist()
+            d.update(dict(zip(txtfns, [zipfn]*len(txtfns))))
+        return d
+
+    def read_asset_identity_file_fromzip(self):
+        header = "Barrid|Name|Instrument|IssuerID|ISOCountryCode|ISOCurrencyCode|RootID|StartDate|EndDate".split("|")
+        fn = "USA_Asset_Identity." + self.data_ymd
+        zipfn = self.d_txt2zip[fn]
+        archive = zipfile.ZipFile(zipfn, 'r')
+        rows = []
+        with archive.open(fn, "r") as fp:
+            for line in fp:
+                if line[0] == "!" or line[0] == '[':
+                    continue
+                ff = line.rstrip().split("|")
+                if ff[4] == "USA" and ff[5] == "USD" and ff[7] <= self.data_ymd <= ff[8]:
+                    rows.append(ff)
+            fp.close()
+        archive.close()
+        return pd.DataFrame(rows, columns=header)
+
+    def read_asset_identity_file(self):
+        header = "Barrid|Name|Instrument|IssuerID|ISOCountryCode|ISOCurrencyCode|RootID|StartDate|EndDate".split("|")
+        fn = self.data_dir + "USA_Asset_Identity." + self.data_ymd
+        rows = []
+        with open(fn, "r") as fp:
+            for line in fp:
+                if line[0] == "!" or line[0] == '[':
+                    continue
+                ff = line.rstrip().split("|")
+                if ff[4] == "USA" and ff[5] == "USD" and ff[7] <= self.data_ymd <= ff[8]:
+                    rows.append(ff)
+            fp.close()
+        return pd.DataFrame(rows, columns=header)
+
+    def read_asset_id_file(self):
+        header = "Barrid|AssetIDType|AssetID|StartDate|EndDate".split("|")
+        fn = self.data_dir + "USA_Asset_ID" + self.data_ymd
+        d = {}
+        with open(fn, "r") as fp:
+            for line in fp:
+                if line[0] == "!" or line[0] == "[":
+                    continue
+                ff = line.rstrip().split("|")
+                if ff[1] == "LOCALID" and ff[3] <= self.data_ymd <= ff[4] and ff[2][0:2] == "US":
+                    d[ff[2][2:]] == ff[0]
+        fp.close()
+        return d
+
+    def read_asset_exposure_file(self):
+        header = "Barrid|Factor|Expsure|DataDate"
+        d = {}
+        for type in ["", "_ETF"]:
+            fn = self.data_dir + "USFASTD{}_100_Asset_Exposure.{}".format(type, self.data_ymd)
+            with open(fn, "r") as fp:
+                for line in fp:
+                    if line[0] == "!" or line[0] == "[":
+                        continue
+                    ff = line.rstrip().split("|")
+                    if self.data_ymd != ff[3]:
+                        print("Bad asset exposure date")
+                        exit(1)
+                    if ff[0] not in d:
+                        d[ff[0]] = {}
+                    d[ff[0]][ff[1]] = float(ff[2])
+            fp.close()
+        return d
+
+    def read_covariance_file(self):
+        header = "Factor1|Factor2|VarCovar|DataDate"
+        fn = self.data_dir + "USFASTD_100_Covariance." + self.data_ymd
+        d = {}
+        dF = {}
+        F = []
+        with open(fn, "r") as fp:
+            for line in fp:
+                if line[0] == "!" or line[0] == "[":
+                    continue
+                ff = line.rstrip().split("|")
+                if ff[3] != self.data_ymd:
+                    print("Bad covariance date")
+                    exit(1)
+                if ff[0] not in d:
+                    d[ff[0]] = {}
+                if ff[1] not in d:
+                    d[ff[1]] = {}
+                if ff[0] not in dF:
+                    F.append(ff[0])
+                    dF[ff[0]] = 1
+                d[ff[0]][ff[1]] = float(ff[2])
+                d[ff[1]][ff[0]] = float(ff[2])
+        fp.close()
+        return (d, F)
+
+    def read_asset_data_file(self):
+        header = "Barrid|Yield|TotalRisk|SpecRisk%|HistBeta|PredBeta|DataDate"
+        d_risk = {}
+        d_beta = {}
+        d_volatility = {}
+        for type in ["", "_ETF"]:
+            fn = self.data_dir + "/USFASTD{}_100_Asset_Data.{}".format(type, self.data_ymd)
+            with open(fn, "r") as fp:
+                for line in fp:
+                    if line[0] == "!" or line[0] == "[":
+                        continue
+                    ff = line.rstrip().split("|")
+                    if ff[0] in d_risk:
+                        print("duplicate barrid {} in read_asset_data_file on {}".format(ff[0], self.data_ymd))
+                    if ff[6] != self.data_ymd:
+                        print("bad asset data date")
+                        continue
+                    d_risk[ff[0]] = float(ff[3])
+                    d_beta[ff[0]] = float(ff[5])
+                    d_volatility[ff[0]] = float(ff[2])
+            fp.close()
+        return (d_risk, d_beta, d_volatility)
+
+    def read_daily_return_file(self):
+        header = "Barrid|SpecificReturn|DataDate"
+        ds = []
+        for type in ["USFASTD_100_DlyFacREt", "USFAST_100_Asset_DlySpecRet"]:
+            d = {}
+            fn = self.data_dir + "{}.{}".format(type, self.data_ymd)
+            with open(fn, "r") as fp:
+                for line in fp:
+                    if line[0] == "!" or line[0] == "[":
+                        continue
+                    ff = line.rstrip().split("|")
+                    if ff[2] != self.data_ymd:
+                        continue
+                    if ff[0] in d:
+                        print("duplicate return for {} on {}".format(ff[0], self.data_ymd))
+                    d[ff[0]] = float(ff[1])
+            fp.close()
+            ds.append(d)
+        return ds
+
+    def read_asset_price_file(self):
+        header = "Barrid|Price|Capt|PriceSource|Currency|DlyReturn|DataDate".split("|")
+        fn = self.data_dir + "/USFAST_Daily_Asset_Price." + self.data_ymd
+        rows = []
+        with open(fn, "r") as fp:
+            for line in fp:
+                if line[0] == "!" or line[0] == "[":
+                    continue
+                ff = line.rstrip().split("|")
+                if ff[6] != self.data_ymd:
+                    print("bad asset price date")
+                    continue
+                rows.append(ff)
+        fp.close()
+        df = pd.DataFrame(rows, columns=header)
+        df.index = df.Barrid
+        return df
+
+    def read_market_data_file(self):
+        header = "Barrid|BidAskSpread|ADBAS_30|ADBAS_60|ADBAS_90|DailyVolume|ADTV_30|ADTV_60|ADTV_90|ADPS|CompositeVolume|ADTCV_30|ADTCV_60|ADTCV_90|ADTCA_30".split('|')
+        fn = self.data_dir + "/USFAST_Market_Data." + self.data_ymd
+        rows = []
+        with open(fn, "r") as fp:
+            for line in fp:
+                if line[0] == "!" or line[0] == "[":
+                    continue
+                ff = line.rstrip().split("|")
+                if ff[-1] != self.data_ymd:
+                    print("bad market data date")
+                    continue
+                rows.append(ff)
+        fp.close()
+        df = pd.DataFrame(rows, columns=header)
+        df.index = df.Barrid
+        return df
+
+    def get_universe(self):
+        df = self.read_asset_identity_file()
+        self.universe = df.Barrid.unique()
+        self.dBarrId = self.read_asset_id_file()
+
+    def get_loadings(self):
+        self.dL = self.read_asset_exposure_file()
+
+    def get_risk_data(self):
+        (self.dC, self.factors) = self.read_covariance_file()
+        (self.dSR, self.dB, self.dV) = self.read_asset_data_file()
+
+    def get_return_data(self):
+        (self.dFacRet, self.dSpecRet) = self.read_daily_return_file()
+
+    def get_asset_price(self):
+        self.dMC = self.read_asset_price_file()
+
+    def gen_loading_matrix(self, tickers):
+        barrids = [self.dBarrId[tk] for tk in tickers]
+        L = np.zeros(len(barrids), len(self.factors))
+        for i in range(len(barrids)):
+            for j in range(len(self.factors)):
+                L[i, j] = self.dL[barrids[i]].get(self.factors[j], 0.0)
+        return L
+
+    def gen_covariance_matrix(self):
+        FCov = np.zeros(len(self.factors), len(self.factors))
+        for i in range(len(self.factors)):
+            for j in range(len(self.factors)):
+                FCov[i, j] = self.dC[self.factors[i]][self.factors[j]]
+        return FCov
+
+    def gen_specific_variance(self, tickers):
+        barrids = [self.dBarrId[tk] for tk in tickers]
+        return np.array([self.dSR[key] ** 2 for key in barrids])
+
+    def gen_shares_outstanding(self, tickers):
+        barrids = [self.dBarrId[tk] for tk in tickers]
+        return (self.dMC.Capt.apply(lambda x: np.nan if x == "" else float(x)) / self.dMC.Price.astype(float)).loc[barrids].values
+
+    def gen_daily_return(self, barrids):
+        #barrids = [self.dBarrId[tk] for tk in tickers]
+        return self.dMC.DlyReturn.astype(float).loc[barrids].values
+
+    def gen_factor_return(self, factors):
+        return np.array([self.dFacRet[key] for key in factors])
+
+    def gen_specific_return(self, barrids):
+        return np.array([self.dSpecRet.get(key, 0.0) * 1.0e-2 for key in barrids])
+
+    def gen_annual_volatility(self, tickers):
+        barrids = [self.dBarrId[tk] for tk in tickers]
+        return np.array([self.dV.get(self.dBarrId[tk], np.nan) for tk in tickers])
+
+    def gen_beta(self, tickers):
+        return np.array([self.dB.get(self.dBarrId[tk], np.nan) for tk in tickers])
+
+    def gen_stats(self, tickers, key="ADTCV_30"):
+        barrids = [self.dBarrId[tk] for tk in tickers]
+        df = self.read_market_data_file()
+        return df.loc[barrids, key].apply(lambda x: np.nan if x =="" else float(x)).values
+
+if __name__ == '__main__':
+    bdl = BarraDataLoader('20180227')
+    cm = bdl.gen_covariance_matrix()
+    fl = bdl.gen_loading_matrix(['AAPL', 'IBM'])
+    bdl.gen_stats(['IBM', 'SPY'])
+    df = bdl.read_market_data_file()
