@@ -1,0 +1,53 @@
+import pandas as pd
+import numpy as np
+import os
+import Utils.DateTimeUtils as udt
+import Utils.BarraDataLoader as ubr
+
+data_type = ['barra_ids', 'close_prices', 'returns', 'volumes', 'adv30ds', 'betas']
+
+def gen_table(st, en):
+    d = {}
+    for dtp in data_type:
+        d[dtp] = []
+    for dt in udt.getTradingDays(st, en):
+        print(dt)
+        ymd = dt.stftime('%Y%m%d')
+        bdl = ubr.BarraDataLoader(ymd, load_data=False)
+        d_brid = bdl.read_asset_id_file()
+        df_identity = bdl.read_asset_identity_file()
+        df_price = bdl.read_asset_id_file()
+        df_md = bdl.read_market_data_file()
+        (_, dB, _) = bdl.read_asset_data_file()
+        universe = df_identity.Barrid.values
+        d['close_prices'].append(df_price.Price.reindex(universe).rename(ymd))
+        d['returns'].append(df_price.DlyReturn.reindex(universe).rename(ymd))
+        d['barra_ids'].append(pd.Series(d_brid).rename(ymd))
+        d['volumes'].append(df_md['CompositeVolume'].reindex(universe).rename(ymd))
+        d['adv30ds'].append(df_md['ADTCV_30'].reindex(universe).rename(ymd))
+        d['betas'].append(pd.Series([dB.get(x, np.nan) for x in universe], index=universe, name=ymd))
+    for dtp in data_type:
+        d[dtp] = pd.concat(d[dtp], axis=1)
+        if dtp == 'barra_ids':
+            d[dtp].fillna('')
+        else:
+            d[dtp][d[dtp] == ''] = np.nan
+    return d
+
+
+if __name__ == '__main__':
+    today = pd.Timestamp.now().date()
+    yesterday = udt.getPrevTrd(today)
+    d = {}
+    if os.path.exists('D:/RefData/close_prices.csv'):
+        for dtp in data_type:
+            d[dtp] = pd.read_csv('D:/RefData/{}.csv'.format(dtp), index_col=0)
+        st = udt.getNextTrd(sorted(d['close_prices'].columns)[-1])
+        d_new = gen_table(st, yesterday)
+        for dtp in data_type:
+            d[dtp] = pd.concat([d[dtp], d_new[dtp]], axis=1, sort=False)
+    else:
+        d = gen_table('20170101', yesterday)
+    for dtp in data_type:
+        d[dtp].to_csv('D;/RefData/{}.csv'.format(dtp))
+
