@@ -1,53 +1,180 @@
 import pandas as pd
 import numpy as np
-import os
-import Utils.DateTimeUtils as udt
-import Utils.BarraDataLoader as ubr
+import Utils.DataAnalysisUtils as uda
+from sklearn import linear_model
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
 
-data_type = ['barra_ids', 'close_prices', 'returns', 'volumes', 'adv30ds', 'betas']
+# cross validation
+# for each day, use 3 month before's data to fit and predict on that day, you have 5 copies of
+# prediction for each, then compare the power for the prediction on all days
+# or we can predict on each month
+# for simplicity, here i only want to split into training and validation set to evaluate the power
 
-def gen_table(st, en):
-    d = {}
-    for dtp in data_type:
-        d[dtp] = []
-    for dt in udt.getTradingDays(st, en):
-        print(dt)
-        ymd = dt.stftime('%Y%m%d')
-        bdl = ubr.BarraDataLoader(ymd, load_data=False)
-        d_brid = bdl.read_asset_id_file()
-        df_identity = bdl.read_asset_identity_file()
-        df_price = bdl.read_asset_id_file()
-        df_md = bdl.read_market_data_file()
-        (_, dB, _) = bdl.read_asset_data_file()
-        universe = df_identity.Barrid.values
-        d['close_prices'].append(df_price.Price.reindex(universe).rename(ymd))
-        d['returns'].append(df_price.DlyReturn.reindex(universe).rename(ymd))
-        d['barra_ids'].append(pd.Series(d_brid).rename(ymd))
-        d['volumes'].append(df_md['CompositeVolume'].reindex(universe).rename(ymd))
-        d['adv30ds'].append(df_md['ADTCV_30'].reindex(universe).rename(ymd))
-        d['betas'].append(pd.Series([dB.get(x, np.nan) for x in universe], index=universe, name=ymd))
-    for dtp in data_type:
-        d[dtp] = pd.concat(d[dtp], axis=1)
-        if dtp == 'barra_ids':
-            d[dtp].fillna('')
-        else:
-            d[dtp][d[dtp] == ''] = np.nan
-    return d
+HLs = [1,2,5,10]
+N = 5
+
+def model_fit():
+    # get data, x, y names, training and validation data
+    df = pd.read_csv('D:/FrameWork/dataset/ho_imb.20200201.20201031.csv', index_col=0, converters={'ymd': str})
+    ynames = ['y_{}'.format(i) for i in range(N+1)]
+    clip_ynames = ['clip_y_{}'.format(i) for i in range(N+1)]
+    resid_ynames = ['clip_y_{}_resid'.format(i) for i in range(N+1)]
+    xnames = ['imb_resid'] + ['imb_{}_resid'.format(hl) for hl in HLs] + ['weighted_imb_{}_resid'.format(hl) for hl in HLs] \
+           + ['imb_srisk'] + ['imb_{}_srisk'.format(hl) for hl in HLs] + ['weighted_imb_{}_srisk'.format(hl) for hl in HLs]
+    yname = 'clip_y_2_resid'
+    nsym = df.ric.value_counts()
+    goodsym = nsym.index[nsym > 150]
+    ff = df.ric.isin(goodsym)
+
+    uda.ols_analysis(df[ff], xnames, ynames)
+
+    Z_all = df[ff]
+    Z_test = df[ff & (df.ymd >= '20201001')]
+    y_test = Z_test[yname]
+    Z_tv = df[ff & (df.ymd < '20201001') & (df.ymd > '20200131')]
+    y_tv = Z_tv[yname]
+    Z_train, Z_validation, y_train, y_validation = train_test_split(Z_tv, Z_tv[yname], test_size=0.3, random_state=123)
+
+    # Ridge
+    for alpha in [0, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10]:
+        clf = linear_model.Ridge(alpha=alpha, fit_intercept=False)
+        clf.fit(Z_train[xnames], y_train, sample_weight=1.0/(Z_train['dvol'] ** 2))
+        preds_train = clf.predict(Z_train[xnames])
+        preds_valid = clf.predict(Z_validation[xnames])
+        sc1 = clf.score(Z_train[xnames], y_train)
+        sc2 = clf.score(Z_validation[xnames], y_validation)
+        coef1 = np.corrcoef(y_train, preds_train)[0,1]
+        coef2 = np.corrcoef(y_validation, preds_valid)[0,1]
+        pw1 = uda.alpha_power(y_train, preds_train)
+        pw2 = uda.alpha_power(y_validation, preds_valid)
+        print('alpha={} Training Score = {} Test Score = {}'.format(alpha, sc1, sc2))
+        print('alpha={} Training Corr Coef = {} Test Corr Coef = {}'.format(alpha, coef1, coef2))
+        print('alpha={} Training Power = {} Test Power = {}'.format(alpha, pw1, pw2))
+        print('')
+    alpha = 1e-3  # pick from previous results
+    clf = linear_model.Ridge(alpha=alpha, fit_intercept=False)
+    clf.fit(Z_tv[xnames], y_tv, sample_weight=1.0 / (Z_train['dvol'] ** 2))
+    preds_test = clf.predict(Z_test[xnames])
+    score = clf.score(Z_test[xnames], y_test)
+    coef = np.corrcoef(preds_test, y_test)[0, 1]
+    pw = uda.alpha_power(preds_test, y_test)
+    print("Test score = {}, corrcoef = {}, power = {}".format(score, coef, pw))
+    for yname in resid_ynames:
+        print(uda.alpha_power(Z_test[yname], preds_test, w=1.0/Z_test['dvol']**2))
+
+def alpha_power(y, yhat, w=None): # the power is also weighted
+    if w is None:
+        w = np.ones(len(y))
+    return np.dot(y*w, yhat) / np.sqrt(np.dot(yhat * w, yhat) * np.sum(w))
+
+def analysis():
+    ndf = udt.get_multi_day('20191031', '20191129', get_one_day)
+    ndf.loc[np.isinf(ndf.x_1m), 'x_1m'] = 0.0
+
+    xnames = ['x_1m', 'x_5m', 'x_10m', 'x_15m', 'x_30m', 'x_wmid', 'x_sqrt_wmid', 'x_lasttrade']
+    ynames = ['y_60', 'y_120', 'y_300', 'y_600', 'y_900', 'y_1800']
+
+    uda.ols_analysis(ndf, xnames, ynames)
+
+    #TryXGB():
+    X = ndf[xnames]
+    y = ndf['y_60']
+
+    X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_state=123)
+    dtrain = xgb.DMatrix(X_train, label=y_train)
+    dtest = xgb.DMatrix(X_test, label=y_test)
+
+    baseline_prediction = np.ones(y_test.shape) * np.mean(y_train)
+    mse_baseline = np.sqrt(mean_squared_error(y_test, baseline_prediction))
+    print("Baseline MSE is {}".format(mse_baseline))
+
+    old_model = sm.OLS(y_train, X_train).fit()
+    preds = old_model.predict(X_test)
+    #sns.regplot(y_test, preds)
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    print("Linear Regression MSE is {}".format(rmse))
+
+    # XGBoost
+    params = {
+        'max_depth': 6,
+        'min_child_weight': 1,
+        'eta': 0.3,
+        'subsample' : 1,
+        'colsample_bytree': 1,
+        'objective': 'reg:squarederror'
+    }
+    num_boost_round = 999
+    params['eval_metric'] = "rmse"
+
+    model = xgb.train(
+        params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        evals=[(dtest, "Test")],
+        early_stopping_rounds=10
+    )
+
+    cv_results = xgb.csv(
+        params,
+        dtrain,
+        num_boost_round=num_boost_round,
+        seed=42,
+        nfold=5,
+        metrics={'rmse'},
+        early_stopping_rounds=10
+    )
+    cv_results
+
+    #optimize eta learning rate
+    # this can take some time
+    min_rmse = float("Inf")
+    best_params = None
+    for eta in [.3, .2, .1, .05, .01, .005]:
+        print("CV with eta={}".format(eta))
+        #we update our parameters
+        params['eta'] = eta
+        # Run and time CV
+        cv_results = xgb.cv(
+            params,
+            dtrain,
+            num_boost_round=num_boost_round,
+            seed=42,
+            nfold=5,
+            metrics=['rmse'],
+            early_stopping_rounds=10
+        )
+        # Update best score
+        mean_rmse = cv_results['test-rmse-mean'].min()
+        boost_rounds = cv_results['test-rmse-mean'].argmin()
+        print("\tRMSE {} for {} rounds\n".format(mean_rmse, boost_rounds))
+        if mean_rmse < min_rmse:
+            min_rmse = mean_rmse
+            best_params = eta
+    print("Best params: {}, MAE: {}".format(best_params, min_rmse))
+
+    xg_reg = xgb.XGBRegressor(objective='reg:squarederror', colsample_bytree=1.0, learning_rate=0.1,
+                              max_depth=5, reg_alpha=0, reg_lambda=0, n_estimators=1000)
+
+    xgb_model = xg_reg.fit(X_train, y_train)
+    fitted = xgb_model.predict(X_train)
+    preds = xg_reg.predict(X_test)
+
+    rmse = np.sqrt(mean_squared_error(y_test, preds))
+    print("R2: %f" % (1-(rmse**2) / y_test.var()))
+
+import statsmodels.api as sm
+
+def ols_analysis(mdf, xnames, ynames):
+    rows = []
+    for yname in ynames:
+        model = sm.OLS(mdf[yname].values, mdf[xnames].values)
+        fit = model.fit()
+        row = [mdf[yname].std(), fit.rsquared] + list(fit.params) + list(fit.tvalues)
+        rows.append(row)
+    colnms = ['y_std', 'R'] + xnames + ['t_{}'.format(x) for x in xnames]
+    odf = pd.DataFrame(rows, columns=colnms, index=ynames).T
+    print(odf)
 
 
-if __name__ == '__main__':
-    today = pd.Timestamp.now().date()
-    yesterday = udt.getPrevTrd(today)
-    d = {}
-    if os.path.exists('D:/RefData/close_prices.csv'):
-        for dtp in data_type:
-            d[dtp] = pd.read_csv('D:/RefData/{}.csv'.format(dtp), index_col=0)
-        st = udt.getNextTrd(sorted(d['close_prices'].columns)[-1])
-        d_new = gen_table(st, yesterday)
-        for dtp in data_type:
-            d[dtp] = pd.concat([d[dtp], d_new[dtp]], axis=1, sort=False)
-    else:
-        d = gen_table('20170101', yesterday)
-    for dtp in data_type:
-        d[dtp].to_csv('D;/RefData/{}.csv'.format(dtp))
 
