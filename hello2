@@ -1,87 +1,75 @@
-import numpy as np
 
-class PriceTable:
-    def __init__(self, cc='HKG'):
-        if cc == "HKC":
-            # https://www.hkex.com.hk/-/media/HKEX-Market/Services/Rules-and-Forms-and-Fees/Rules/SEHK/Securities/Rules/sch-2_eng.pdf?la=en
-            self.price_bin = np.array([0.01, 0.25, 0.50, 10.00, 20.00, 100.00, 200.00, 500.00, 1000.00, 2000.00, 5000.00, 9995.00])
-            self.tick_size = np.array([0.001, 0.005, 0.010, 0.020, 0.050, 0.100, 0.200, 0.500, 1.000, 2.000, 5.000])
-            self.round_to = 3
-        elif cc == 'KOR':
-            # http://global.krx.co.kr/contents/GLB/06/0602/0602010201/GLB0602010201.jsp#826f2bceb71bdd795d4f782fda605cb1=3
-            self.price_bin = np.array([0, 1000, 5000, 10000, 50000, 100000, 500000, 1e6])
-            self.tick_size = np.array([1, 5, 10, 50, 100, 500, 1000])
-            self.round_to = 0
-        elif cc == 'TWN':
-            # https://www.twse.com.tw/en/page/products/trading/introduce.html
-            self.price_bin = np.array([0.01, 10.0, 50.0, 100.0, 500.0, 1000.0, 9999.0])
-            self.tick_size = np.array([0.01, 0.05, 0.10, 0.50, 1.00, 5.00])
-            self.round_to = 2
-        else:
-            print("!!!! no tick schedule yet for {} !!!!".format(cc))
-        self._generate_price_table()
+echo ===== enter LIX bashrc ==========
 
-    def _generate_price_table(self):
-        valid_prices = []
-        pr = self.price_bin[0]
-        for i in range(len(self.tick_size)):
-            while pr < self.price_bin[i+1]:
-                valid_prices.append(pr)
-                pr += self.tick_size[i]
-                pr = np.round(pr, self.round_to)
-        valid_prices.append(pr)
-        self.price_table = valid_prices
-        self.price_idx = dict(zip(valid_prices, range(len(valid_prices))))
-        self.table_size = len(valid_prices)
+# Environment Variables
 
-    def getPriceDown(self, price, n=1):
-        if price in self.price_idx:
-            idx = self.price_idx[price]
-        else:
-            idx = np.searchsorted(self.price_table, price, side='left')
-            if idx == 0:
-                print("!!!! price already below lower limit !!!")
+# Shell Options
 
-        new_idx = idx - n
-        if new_idx < 0:
-            print("!!! new index out of range (below) !!!")
-        else:
-            return self.price_table[new_idx]
+# do not save bash history
+unset HISTFILE
 
-    def getPriceUp(self, price, n=1):
-        if price in self.price_idx:
-            idx = self.price_idx[price]
-        else:
-            idx = np.searchsorted(self.price_table, price, side='left') - 1
-            if idx >= self.table_size:
-                print("!!!! price already above upper limit !!!")
+# Aliases
 
-        new_idx = idx + n
-        if new_idx >= self.table_size:
-            print("!!! new index out of range (above) !!!")
-        else:
-            return self.price_table[new_idx]
+alias goto=". /cygdrive/d/MyProgEnviron/scripts/goto.sh"
+alias xterm="xterm -bg black -fg white -fn 10x20 &"
+alias rm="rm -i"
+alias cp="cp -i"
+alias mv="mv -i"
+alias ls='ls --color=tty'
+alias vimr='vim "+set nomodifiable"'   # invoke vim in real readonly mode
 
-    # get price less than or equal to
-    def getPriceLE(self, price):
-        idx = np.searchsorted(self.price_table, price, side='right')
-        return self.price_table[idx-1]
+# Functions
+# function settitle() { echo -ne "\e]2;$@\a\e]1;$@\a"; }
 
-    # get price greater than or equal to
-    def getPriceGE(self, price):
-        idx = np.searchsorted(self.price_table, price, side='left')
-        return self.price_table[idx]
+export PS1="\u@\h-\t|\w|\!: "
+export PATH=.:$PATH:/cygdrive/d/MyProgEnviron/scripts
+#export TERM=xterm-256color
+PERL5LIB=/cygdrive/d/MyProgEnviron/pgms/perl
 
-if __name__ == '__main__':
-    tksch = PriceTable('HKG')
-    tksch.getPriceDown(0.25)
-    tksch.getPriceUp(0.25)
-    tksch.getPriceDown(0.251)
-    tksch.getPriceUp(0.2553)
 
-    tksch.getPriceDown(20)
-    tksch.getPriceUp(20)
-    tksch.getPriceDown(20.0001)
-    tksch.getPriceUp(20.0001)
+cd /cygdrive/d
 
+vimrc
+
+"" don't save vim history and cashe into ~/.viminfo
+set viminfo=
+
+"" turn on syntax highlight and use a special color scheme
+if has("syntax")
+   syntax on
+   let g:zenburn_high_Contrast=1
+   colorscheme zenburn
+endif
+
+"" do not display line number
+set nonumber
+set ruler
+
+
+
+
+1) bash startup file is ~/.bash_profile.  So i will add a line in that file to set up my environment.
+   source /cygdrive/d/MyProgEnviron/config/bashrc
+   You may also want to put this line at the end of ~/.bashrc, because when you use xterm to open a
+   new shell, only ~/.bashrc will be executed. ~/.bash_profile is only executed by login shell.
+
+2) R startup file is at C:\Program Files\R\R-2.15.1\etc\Rprofile.site.  So i will add a line in that 
+   file to source my own config file.
+   source("D:\\MyProgEnviron\\config\\Rprofile")
+
+3) vim config.  The default vim config file is ~/.vimrc. I will write a personal vim config file
+   and add a line in ~/.vimrc file to source mine.
+   source /cygdrive/d/MyProgEnviron/config/vimrc
+
+   In my vimrc file. 
+   *) downdown zenburn color scheme http://www.vim.org/scripts/script.php?script_id=415
+      downdload either the .vba or .vim file depending on your vimball version.  It seems that
+      only .vim version works on my computer. 
+   *) create ~/.vim/colors directory, copy the downloaded color into that folder.
+   *) in .vimrc file, add the line
+      colorscheme zenburn
+      or when you already inside vim editing something, you can turn the color scheme on by typing
+      :colorscheme zenburn
+   *) I want the high contrast version, so I 
+      let g:zenburn_high_Contrast=1
 
