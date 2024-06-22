@@ -1,75 +1,94 @@
+import sys
+import pandas as pd
+import numpy as np
+import functools
 
-echo ===== enter LIX bashrc ==========
+# this version of DateTimeUntils can take care of strategy that trade several contries with different holiday
+# schedule, we can use the union of all holidays
+# it is for the pair trading strategy
 
-# Environment Variables
+def _read_holiday_file():
+    d = {}
+    hfn = 'W:/pgms/Python/Utils/CHN_HKG_CountryHolidays'
+    fp = open(hfn, 'r')
+    for line in fp:
+        if line[0] in ['!', '[']:
+            continue
+        else:
+            cc, ymd = line.rstrip().split('|')
+            if cc not in d:
+                d[cc] = []
+            else:
+                d[cc].append(ymd)
+    #end for
+    return d
 
-# Shell Options
+d_holidays = _read_holiday_file()
 
-# do not save bash history
-unset HISTFILE
+# the country code can be 'HKG|CHN", so the holiday will be the union of two countries
+# we use such calendar to study cross country strategies.
+def cc2holidays(cc):
+    cs = cc.split('|')
+    holidays = set([])
+    for c in cs:
+        holidays = holidays.union(set(d_holidays[c]))
+    return list(holidays)
 
-# Aliases
+def getTraingDays(st, en, cc='CHN'):
+    bdays = pd.bdate_range(st, en).to_series()
+    return bdays[~bdays.isin(cc2holidays(cc))]
 
-alias goto=". /cygdrive/d/MyProgEnviron/scripts/goto.sh"
-alias xterm="xterm -bg black -fg white -fn 10x20 &"
-alias rm="rm -i"
-alias cp="cp -i"
-alias mv="mv -i"
-alias ls='ls --color=tty'
-alias vimr='vim "+set nomodifiable"'   # invoke vim in real readonly mode
+def getNTradingDays(st, N, cc='CHN'):
+    bdays = pd.bdate_range(st, pd.to_datetime(st)+pd.Timedelta(days=1.5*N+20)).to_series()
+    return bdays[~bdays.isin(cc2holidays(cc))][:N]
 
-# Functions
-# function settitle() { echo -ne "\e]2;$@\a\e]1;$@\a"; }
+def getNextTradingDay(ymd, n=1, retfmt='%Y%m%d', cc='CHN'):
+    if n < 1:
+        print('n must be greater than or equal to 1')
+        return
+    bdays = getTraingDays(pd.to_datetime(ymd) + pd.Timedelta(days=1),
+                          pd.to_datetime(ymd) + pd.Timedelta(days=int(n * 1.5) + 20), cc=cc)
+    dt64 = bdays[n-1]
+    if retfmt:
+        return dt64.strftime(retfmt)
+    else:
+        return dt64
 
-export PS1="\u@\h-\t|\w|\!: "
-export PATH=.:$PATH:/cygdrive/d/MyProgEnviron/scripts
-#export TERM=xterm-256color
-PERL5LIB=/cygdrive/d/MyProgEnviron/pgms/perl
+def getPrevTradingDay(ymd, n=1, retfmt='%Y%m%d', cc='CHN'):
+    if n < 1:
+        print('n must be greater than or equal to 1')
+        return
+    bdays = getTraingDays(pd.to_datetime(ymd) + pd.Timedelta(days=int(n * 1.5) + 20),
+                          pd.to_datetime(ymd) + pd.Timedelta(days=1), cc=cc)
+    dt64 = bdays[-n]
+    if retfmt:
+        return dt64.strftime(retfmt)
+    else:
+        return dt64
 
+# i need to improve this function, to add **kwarg type of parameters so we can pass more
+# argument to this function.
 
-cd /cygdrive/d
+def get_multi_day(st, en, func, cc='CHN', **kwargs):
+    tdfs = []
+    for dt in getTraingDays(st, en, cc=cc):
+        print(dt)
+        ymd = dt.strftime('%Y%m%d')
+        tmp_df = func(ymd, **kwargs)
+        tdfs.append(tmp_df)
+    df = pd.concat(tdfs, axis=0)
+    return df
 
-vimrc
+def hms2ssm(hms):
+    return functools.reduce(lambda acc, x: acc*60 + x, map(float, hms.split(':')))
 
-"" don't save vim history and cashe into ~/.viminfo
-set viminfo=
+def ssm2hms(ssm):
+    h = ssm // 3600
+    r = ssm - h * 3600
+    m = r // 60
+    s = r - m * 60
+    return '{:02d}:{:02d}:{:02d}'.format(h, m, s)
 
-"" turn on syntax highlight and use a special color scheme
-if has("syntax")
-   syntax on
-   let g:zenburn_high_Contrast=1
-   colorscheme zenburn
-endif
-
-"" do not display line number
-set nonumber
-set ruler
-
-
-
-
-1) bash startup file is ~/.bash_profile.  So i will add a line in that file to set up my environment.
-   source /cygdrive/d/MyProgEnviron/config/bashrc
-   You may also want to put this line at the end of ~/.bashrc, because when you use xterm to open a
-   new shell, only ~/.bashrc will be executed. ~/.bash_profile is only executed by login shell.
-
-2) R startup file is at C:\Program Files\R\R-2.15.1\etc\Rprofile.site.  So i will add a line in that 
-   file to source my own config file.
-   source("D:\\MyProgEnviron\\config\\Rprofile")
-
-3) vim config.  The default vim config file is ~/.vimrc. I will write a personal vim config file
-   and add a line in ~/.vimrc file to source mine.
-   source /cygdrive/d/MyProgEnviron/config/vimrc
-
-   In my vimrc file. 
-   *) downdown zenburn color scheme http://www.vim.org/scripts/script.php?script_id=415
-      downdload either the .vba or .vim file depending on your vimball version.  It seems that
-      only .vim version works on my computer. 
-   *) create ~/.vim/colors directory, copy the downloaded color into that folder.
-   *) in .vimrc file, add the line
-      colorscheme zenburn
-      or when you already inside vim editing something, you can turn the color scheme on by typing
-      :colorscheme zenburn
-   *) I want the high contrast version, so I 
-      let g:zenburn_high_Contrast=1
+if __name__ == '__main__':
+    getTraingDays('20190101', '20190228')
 
