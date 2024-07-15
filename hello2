@@ -1,94 +1,590 @@
-import sys
+# This is for tracking daily trading and positions and print out stats on
+# trades, position and pnl
+# we can also add functions to update on each intraday trades, so this module
+# can work with a simulator, where strategy part generate orders, execution part
+# simulate filss and this keep track of it
+
 import pandas as pd
 import numpy as np
-import functools
+from abc import ABC, abstractmethod
+import os
 
-# this version of DateTimeUntils can take care of strategy that trade several contries with different holiday
-# schedule, we can use the union of all holidays
-# it is for the pair trading strategy
+import Utils.DateTimeUtils as udt
+import Utils.SymbolMapping as usm
+import Utils.FactsetData as ufs
+import Utils.BloombergAPI as ubb
+import Utils.D1TradingQuery as udl
 
-def _read_holiday_file():
-    d = {}
-    hfn = 'W:/pgms/Python/Utils/CHN_HKG_CountryHolidays'
-    fp = open(hfn, 'r')
-    for line in fp:
-        if line[0] in ['!', '[']:
-            continue
+class PnLPosTracker(ABC):
+    def __init__(self, calendar='HKG', country_issued_code='HK', save=False, save_dir='', loadsymap=True):
+        self.fut_contract_size = pd.Series({'HSI': 50, 'HCEI': 50})
+        self.trd_stats_header = ['n_buy', 'n_sell', 'stk_delta_buy', 'stk_delta_sell', 'stk_delta_nettrd', 'max_buy', 'max_sell']
+        self.pos_stats_header = ['nlong', 'nshort', 'stk_delta_long', 'stk_delta_short', 'max_stk_long', 'max_stk_short', 'stk_delta_net', 'hdg_delta_net', 'cash']
+        self.pnl_stats_header = ['pos_pnl', 'pos_pnl_hdg', 'trd_pnl', 'trd_pnl_hdg', 'daily_pnl', 'dividend', 'split']
+        self.cc = calendar
+        self.save = save
+        self.save_dir = save_dir
+        if loadsymap:
+            self.get_symap(country_issued_code)
+
+    def get_symap(self, country_issued_code='HK'): # county_issued_code could be HK, TW, CH
+        # first, we load an in-house databased that maps between all kinds of symbols
+        # such as bloomberg code, ticker, ric, cusip, isin, sedol and etc.
+        # then we load factset database that maps between sedol and fsym_id
+        sedols = usm.getsyms(['ric_code', 'bb_composite_code', 'sedol_code'], filter="country_issued_code='{}'".format(country_issued_code))
+        sedols = sedols[~sedols.sedol_code.isnull()].copy()
+        sedols.index = sedols.ric_code.values
+        tdf = ufs.sedol2fsym(sedols.sedol_code.values)
+        tdf.index = tdf.sedol
+        sedols['fsym'] = tdf.fsym.reindex(sedols.sedol_code.values).values
+        sedols['rics'] = sedols.index.values
+        self.symap = sedols
+        self.ric2fsym = sedols.fsym
+
+    @abstractmethod
+    def get_trades(self, ymd):
+        # this function must return a data frame with ric, side, size, price, sgn, sgnval, absval and timestamp
+        pass
+
+    @abstractmethod
+    def get_position(self, ymd):
+        # return a data frame with ric, shares and close prices, index is ric
+        pass
+
+    def gen_trd_stats(self, trddf):
+        if trddf.shape[0] < 1:
+            return [0] * len(self.trd_stats_header)
+        ishedge = self.ishedge(trddf.ric.values)
+        trddf = trddf[~ishedge]
+        bf = trddf.side.str[0] == 'B'
+        n_buy = (bf).sum()
+        n_sell = (~bf).sum()
+        delta_buy = trddf.absval[bf].sum()
+        delta_sell = trddf.absval[~bf].sum()
+        delta_net = trddf.sgnval.sum()
+        max_buy = max(trddf.absval[bf].values, default=0)
+        max_sell = max(trddf.absval[~bf].values, default=0)
+        return [n_buy, n_sell, delta_buy, delta_sell, delta_net, max_buy, max_sell]
+
+    def gen_pos_stats(self, pos):
+        if pos.shape[0] < 1:
+            return [0] * len(self.pos_stats_header)
+        cash = pos['shares'].get('cash', 0)
+        subpos = pos[pos.index != 'cash']
+        ishedge = self.ishedge(subpos.index.values)
+        delta = subpos.shares.values * subpos.clspr.values
+        nethedge = delta[ishedge].sum()
+        absdelta = np.abs(delta)
+        lf = subpos.shares > 0
+        f1 = (lf) & (~ishedge)
+        f2 = (~lf) & (~ishedge)
+        n_long = f1.sum()
+        n_short = f2.sum()
+        delta_long = absdelta[f1].sum()
+        delta_short = absdelta[f2].sum()
+        delta_net = delta[~ishedge].sum()
+        max_long = max(absdelta[f1], default=0)
+        max_short = max(absdelta[f2], default=0)
+        return[n_long, n_short, delta_long, delta_short, max_long, max_short, delta_net, nethedge, cash]
+
+    def gen_pnl_stats(self, prev_pos, sod_pos, trddf):
+        if sod_pos.shape[0] > 0:
+            hf1 = self.ishedge(sod_pos.index.values)
+            hf0 = self.ishedge(prev_pos.index.values)
+            pos_pnl = np.dot(sod_pos.shares.values, sod_pos.clspr.values) - np.dot(prev_pos.shares.values, prev_pos.clspr.values)
+            pos_pnl_hdg = np.dot(sod_pos.shares.values[hf1], sod_pos.clspr.values[hf1]) - np.dot(prev_pos.shares.values[hf0], prev_pos.clspr.values[hf0])
         else:
-            cc, ymd = line.rstrip().split('|')
-            if cc not in d:
-                d[cc] = []
+            pos_pnl = 0.0
+            pos_pnl_hdg = 0.0
+        posdiff = sod_pos.shares - prev_pos.shares
+        dividend = posdiff.get('cash', default=0.0)
+        if 'cash' in posdiff.index:
+            posdiff.drop(index=['cash'], inplace=True)
+        split = (posdiff != 0).sum() > 0
+        trd_pnl = (trddf.sgnsize * (trddf.clspr - trddf.price)).sum()
+        hf = self.ishedge(trddf.ric.values)
+        trd_pnl_hdg = (trddf.sgnsize * (trddf.clspr - trddf.price))[hf].sum()
+        daily_pnl = pos_pnl + trd_pnl
+        return [pos_pnl, pos_pnl_hdg, trd_pnl, trd_pnl_hdg, daily_pnl, dividend, split]
+
+    def adjust_cac(self, pos, ymd):
+        rics = np.array(list(set(pos.index.values) - set(['cash'])))
+        if len(rics) < 1:
+            return
+        f_hedge = self.ishedge(rics)
+        rics = rics[~f_hedge]
+        if len(rics) < 1:
+            return
+        fsyms = self.ric2fsym.reindex(rics).values
+        fsym2ric = pd.Series(rics, index=fsyms)
+        splits = ufs.get_splits(fsyms, ymd, ymd)
+        divs = ufs.get_divs(fsyms, ymd, ymd)
+        total_div = 0.0
+        if splits.shape[0] > 0:
+            splits.index = fsym2ric.reindex(splits.fsym_id.values).values
+            for i in range(splits.shape[0]):
+                ric = splits.index[i]
+                split_factor = splits['p_split_factor'].iloc[i]
+                pos.loc[ric, 'shares'] = pos.loc[ric, 'shares'] / split_factor
+            print(splits)
+        if divs.shape[0] > 0:
+            divs.index = fsym2ric.reindex(divs.fsym_id.values).values
+            for i in range(divs.shape[0]):
+                ric = divs.index[i]
+                is_spinoff = divs['p_divs_s_spinoff'].iloc[i]
+                div_amount = divs['p_divs_pd'].iloc[i]
+                if is_spinoff:
+                    total_div = total_div + pos.loc[ric, 'shares'] * pos.loc[ric, 'clspr']
+                    print('Spinoff, {} deleted {}'.format(ric, pos.loc[ric]))
+                    pos.drop(index=ric, inplace=True)
+                else:
+                    total_div = total_div + pos.loc[ric, 'shares'] * div_amount
+            print(divs)
+        pos.loc['cash', 'shares'] += total_div
+        return
+
+    def get_clspr(self, rics, ymd):
+        rics = np.array(list(set(rics) - set(['cash'])))
+        if len(rics) < 1:
+            return pd.Series([1.0],index=['cash'])
+        f_hedge = self.ishedge(rics)
+        rics_stk = rics[~f_hedge]
+        rics_hdg = rics[f_hedge]
+
+        if len(rics_stk) > 0:
+            fsyms = self.ric2fsym.reindex(rics_stk).values
+            fsym2ric = pd.Series(rics_stk, index=fsyms)
+            prices = ufs.get_prices(fsyms, ymd, ymd)
+            prices.index = fsym2ric.reindex(prices.fsym_id.values).values
+        else:
+            prices = pd.DataFrame(columns=['p_price'])
+
+        if len(rics_hdg) > 0:
+            bbg_hdg = [self.ric2bbg_futures(x) for x in rics_hdg]
+            bbg2ric = pd.Series(rics_hdg, bbg_hdg)
+            bapi = ubb.BloomObject()
+            tdf = bapi.bdh(bbg_hdg, ['PX_LAST'], pd.to_datetime(ymd), pd.to_datetime(ymd), optional_param_dict=ubb.no_adjust_override)
+            tdf.index = bbg2ric.redinex(tdf.Id.values)
+        else:
+            tdf = pd.DataFrame(columns=['PX_LAST'])
+
+        ss = pd.concat([prices.p_price, tdf.PX_LAST], axis=0)
+        ss['cash'] = 1.0
+        return ss
+
+    def save_df(self, df, ymd, prefix):
+        data_dir = '{}/{}'.format(self.save_dir, ymd)
+        if not os.path.exists(data_dir):
+            os.makedirs(data_dir)
+        fn = '{}/{}.csv'.format(data_dir, prefix)
+        df.to_csv(fn)
+
+    def gen_eod_trd_pos(self, ymd, clsprtype='local'): # this is end of trading day position, no adjust for cac
+        sod_pos = self.get_sod_position(ymd)
+        if sod_pos.shape[0] > 1:
+            clspr = self.get_clspr(sod_pos.index.values, ymd, clsprtype).reindex(sod_pos.index.values).values
+            ff = pd.isnull(clspr)
+            if ff.sum() > 0:
+                print("!!!  previous positon no close price !!!")
+                print(sod_pos[ff])
+            sod_pos.loc['cash', 'shares'] += (sod_pos.shares * sod_pos.clspr)[ff].sum()
+            sod_pos['clspr'] = clspr
+            sod_pos.drop(index=sod_pos.index[ff], inplace=True)
+        trddf = self.get_raw_trades(ymd)
+        if trddf.shape[0] > 0:
+            trddf['clspr'] = self.get_clspr(trddf.ric.values, ymd, clsprtype).reindex(trddf.ric.values).values
+            if trddf.clspr.isnull().sum() > 0:
+                print("!!! trade no close price !!!")
+                print(trddf[trddf.clspr.isnull()])
+            change_shares = trddf.groupby('ric')['sgnsize'].sum()
+            change_shares['cash'] = -trddf.sgnval.sum()
+        else:
+            trddf['clspr'] = []
+            change_shares = pd.Series()
+        pos = pd.DataFrame(pd.concat([sod_pos.shares, change_shares], axis=1, sort=True).fillna(0).sum(axis=1), columns=['shares'])
+        pos = pos[pos.shares.abs() > 0].copy()
+        if pos.shape[0] > 0:
+            pos['clspr'] = self.get_clspr(pos.index.values, ymd, clsprtype).reindex(pos.index.values).values
+        else:
+            pos['clspr'] = []
+        self.save_df(sod_pos, ymd, 'sod_position')
+        self.save_df(pos, ymd, 'position')
+        self.save_df(trddf, ymd, 'trades')
+
+    def gen_sod_position(self, ymd, currency='local'):
+        prev_ymd = udt.getTradingDays(ymd, cc=self.cc)
+        prev_pos = self.get_position(prev_ymd)
+        self.adjust_cac(prev_pos, ymd, currency)
+        self.save_df(prev_pos, ymd, 'sod_position')
+
+    def gen_all_stats(self, st, en):
+        trds = [dt.strftime('%Y%m%d') for dt in udt.getTradingDays(udt.getPrevTrd(st), en, cc=self.cc)]
+        rows = []
+        for i in range(1, len(trds)):
+            prev_ymd = trds[i-1]
+            ymd = trds[i]
+            print(ymd)
+            prev_pos = self.get_position(prev_ymd)
+            sod_pos = self.get_sod_position(ymd)
+            trddf = self.get_trades(ymd)
+            pos = self.get_position(ymd)
+            t_stat = self.gen_trd_stats(trddf)
+            p_stat = self.gen_pos_stats(pos)
+            pnl_stat = self.gen_pnl_stats(prev_pos, sod_pos, trddf)
+            rows.append(t_stat + p_stat + pnl_stat)
+            tdf = pd.concat([prev_pos.shares, * prev_pos.clspr, sod_pos.shares * sod_pos.clspr], axis=1)
+            tdf.fillna(0.0, inplace=True)
+            tdf.columns = ['prev_pos', 'sod_pos']
+            tdf['pnl'] = tdf.sod_pos - tdf.prev_pos
+            dividends = self.get_dividend(ymd)
+            tdf['div'] = dividends.total_div.reindex(tdf.index.values, fill_value=0.0).values
+            self.pospnl[ymd] = tdf
+            self.trdpnl = trddf
+        stats = pd.DataFrame(rows, columns=self.trd_stats_header + self.pos_stats_header + self.pnl_stats_header, index=trddf[1:])
+        stats['cum_pnl'] = stats.daily_pnl.cumsum()
+        return stats
+
+    def change_currency(self, stats, fxrate=7.8):
+        if type(self) == QMM_PnLPosTracker:
+            cols = ['stk_delta_buy_RA', 'stk_delta_sell_RA']
+        else:
+            cols = ['stk_delta_buy', 'stk_delta_sell']
+        for coln in cols:
+            stats[coln] = stats[coln] / fxrate
+
+    def get_trades(self, ymd):
+        fn = '{}/{}/trades.csv'.format(self.save_dir, ymd)
+        if os.path.exists(fn):
+            pos = pd.read_csv(fn, index_col=0, converters={'ts': pd.Timestamp})
+        else:
+            pos = pd.DataFrame(columns=['ric', 'side', 'size', 'price', 'sgn', 'sgnsize', 'sgnval', 'absval'])
+        return pos
+
+    def get_position(self, ymd):
+        fn = '{}/{}/position.csv'.format(self.save_dir, ymd)
+        if os.path.exists(fn):
+            pos = pd.read_csv(fn, index_col=0)
+        else:
+            pos = pd.DataFrame(columns=['shares', 'clspr'])
+        return pos
+
+    def get_sod_position(self, ymd):
+        fn = '{}/{}/position.csv'.format(self.save_dir, ymd)
+        if os.path.exists(fn):
+            pos = pd.read_csv(fn, index_col=0)
+        else:
+            pos = pd.DataFrame(columns=['shares', 'clspr'])
+        return pos
+
+    def get_dividends(self, ymd):
+        fn = '{}/{}/dividends.csv'.format(self.save_dir, ymd)
+        if os.path.exists(fn):
+            divs = pd.read_csv(fn, index_col=0)
+        else:
+            divs = pd.DataFrame(columns=['fsym_id', 'divs_exdate', 'p_divs_pd', 'currency', 'p_divs_s_spinoff', 'p_divs_s_pd', 'shares', 'total_div'])
+        return divs
+
+class QMM_PnLPosTracker(PnLPosTracker):
+    def get_raw_trades(self, ymd):
+        df = uwb.get_strategy_trades(ymd, 'ATSQMM')
+        df['ymd'] = pd.to_datetime(df['ts']).dt.strftime('%Y%m%d')
+        df = pd.concat([df, manualrolltrds, ioitrades], axis=0, sort=True)
+        df['ishedge'] = self.ishedge(df.ric.values)
+        return df
+
+    def isfuture(self, rics):
+        return np.array([x[0:-2] in ('HSI', 'HCEI') for x in rics])
+
+    def ishedge(self, rics):
+        return np.array([x[0:-2] in ('HSI', 'HCEI') for x in rics])
+
+    def get_future_root(self, rics):
+        return np.array([x[0:-2] for x in rics])
+
+    def ric2bbg_futures(self, ric):
+        d = {'HSI': 'HI', 'HCEI': 'HC'}
+        return d[ric[0:-2]] + ric[-2:] + 'Index'
+
+    def gen_trd_stats(self, trddf): # overide for QMM because i want separate RA annd RM
+        if trddf.shape[0] < 1:
+            return [0] * len(self.trd_stats_header)
+        ishedge = self.ishedge(trddf.ric.values)
+        trddf = trddf[~ishedge]
+        is_omm = trddf.ric.isin(self.omm)
+        is_warrant = trddf.crosstradingaccount.isin(['DTG'])
+        is_deriv = trddf.crosstradingaccount.isin(['HKI3'])
+        bf = trddf.side.str[0] == 'B'
+        raf = trddf.algo == 'RA'
+        rmf = trddf.algo == 'RM'
+        n_buy = (bf).sum()
+        n_sell = (~bf).sum()
+        delta_buy_ra = trddf.absval[bf&raf].sum()
+        delta_sell_ra = trddf.absval[(~bf)&raf].sum()
+        delta_buy_rm = trddf.absval[bf & rmf].sum()
+        delta_sell_rm = trddf.absval[(~bf) & rmf].sum()
+        delta_net = trddf.sgnval.sum()
+        max_buy = max(trddf.absval[bf].values, default=0)
+        max_sell = max(trddf.absval[~bf].values, default=0)
+        warrant_notional = trddf.absval[raf&is_warrant].sum()
+        deriv_notional = trddf.absval[raf&is_deriv&(~is_omm)].sum()
+        warrant_notional_rm = trddf.absval[rmf & is_warrant].sum()
+        deriv_notional_rm = trddf.absval[rmf & is_deriv & (~is_omm)].sum()
+        self.trd_stats_header = ['n_buy', 'n_sell', 'stk_delta_buy_RA', 'stk_delta_sell_RA', 'stk_delta_buy_RM', 'stk_delta_sell_RM', 'stk_delta_nettrd', 'max_buy', 'max_sell', 'warrant_notional_ra', 'deriv_notional_ra', 'warrant_notional_rm', 'deriv_notional_rm']
+        return [n_buy, n_sell, delta_buy_ra, delta_sell_ra, delta_buy_rm, delta_sell_rm, delta_net, max_buy, max_sell, warrant_notional, deriv_notional, warrant_notional_rm, deriv_notional_rm]
+
+    def get_trades(self, ymd):
+        fn = '{}/{}/trades.csv'.format(self.save_dir, ymd)
+        if os.path.exists(fn):
+            trddf = pd.read_csv(fn, index_col=0)
+            if 'algo' not in trddf.columns:
+                trddf['algo'] = ''
+                trddf.loc[(trddf.sgn == 1) & (~self.ishedge(trddf.ric.values)), 'algo'] = 'RA'
+                trddf.loc[(trddf.sgn == -1) & (~self.ishedge(trddf.ric.values)), 'algo'] = 'RM'
             else:
-                d[cc].append(ymd)
-    #end for
-    return d
+                trddf = pd.DataFrame(columns=['ric', 'side', 'size', 'price', 'sgn', 'sgnsize', 'sgnval', 'absval', 'algo'])
+            return trddf
 
-d_holidays = _read_holiday_file()
+class HKCA_PnLPosTracker(PnLPosTracker):
+    def get_raw_trades(self, ymd):
+        df = udl.mergeData(useEODSnap=True, eodSnapDate=ymd)
+        df = df.loc[(df.Filled > 0) & (df.Basket.str[0:5] == 'hk_ca'), ['Symbol', 'Side', 'AvgPx', 'Filled', 'Size', 'Timestamp', 'Basket', 'Book']].reset_index(drop=True).copy()
+        df.columns = ['ric', 'side', 'price', 'size', 'order_size', 'timestamp', 'basket', 'book']
+        df['sgn'] = np.where(df.side.str[0] == 'B', 1.0, -1.0)
+        df['sgnsize'] = df['size'] * df['sgn']
+        df['absval'] = df['size'] * df['price']
+        df['sgnval'] = df['sgn'] * df['absval']
+        df['ymd'] = ymd
+        return df
 
-# the country code can be 'HKG|CHN", so the holiday will be the union of two countries
-# we use such calendar to study cross country strategies.
-def cc2holidays(cc):
-    cs = cc.split('|')
-    holidays = set([])
-    for c in cs:
-        holidays = holidays.union(set(d_holidays[c]))
-    return list(holidays)
+    def isfuture(self, rics):
+        return np.array([False] * len(rics))
 
-def getTraingDays(st, en, cc='CHN'):
-    bdays = pd.bdate_range(st, en).to_series()
-    return bdays[~bdays.isin(cc2holidays(cc))]
+    def ishedge(self, rics):
+        return np.array([False] * len(rics))
 
-def getNTradingDays(st, N, cc='CHN'):
-    bdays = pd.bdate_range(st, pd.to_datetime(st)+pd.Timedelta(days=1.5*N+20)).to_series()
-    return bdays[~bdays.isin(cc2holidays(cc))][:N]
+    def gen_hedge_pnl(self, stats):
+        bapi = ubb.BloomObject()
+        tdf = bapi.bdh(['HSI Index'], ['CHG_PCT_1D'], pd.to_datetime(stats.index.min()), pd.to_datetime(stats.index.max()), optional_param_dict=ubb.yes_adjust_override)
+        tdf.index = tdf['date'].apply(lambda x: x.strftime('%Y%m%d'))
+        stats['hdg_ret'] = 0.01 * tdf.CHG_PCT_1D.reindex(stats.index.values).values
+        stats['hdg_pnl'] = -1.0 * stats.stk_delta_net.shift().fillna(0.0).values * stats.hdg_ret.values
+        stats['hedged_pos_pnl'] = stats.pos_pnl + stats.trd_pnl
+        stats['hedged_daily_pnl'] = stats.hedged_pos_pnl + stats.trd_pnl
+        stats['hedged_cumul_pnl'] = stats.hedged_daily_pnl.cumsum()
 
-def getNextTradingDay(ymd, n=1, retfmt='%Y%m%d', cc='CHN'):
-    if n < 1:
-        print('n must be greater than or equal to 1')
-        return
-    bdays = getTraingDays(pd.to_datetime(ymd) + pd.Timedelta(days=1),
-                          pd.to_datetime(ymd) + pd.Timedelta(days=int(n * 1.5) + 20), cc=cc)
-    dt64 = bdays[n-1]
-    if retfmt:
-        return dt64.strftime(retfmt)
+# the drawback with this one is no cac adjustment, problem when there is stock dividend and split
+# and it is hard for this version to calculate pnl and trading stats
+# the PnLAnalyzer is a more sophisticated version of this
+def get_holding_time(ndf, cc='HKG'):
+    trds = [x.strftime('%Y%m%d') for x in udt.getTradingDays(ndf.ymd.min(), ndf.ymd.max(), cc=cc)]
+    ss = pd.Series(range(len(trds)), index=trds)
+    outdf = pd.DataFrame([['', 0, 0, 0, 0]] * ndf.shape[0], index=ndf.index,
+                         columns=['direction', 'intraday_sz', 'intraday_ht', 'crossday_sz', 'crossday_ht'])
+    outdf['shrink_contra'] = [[] for i in range(ndf.shape[0])]
+    outdf['expand_contra'] = [[] for i in range(ndf.shape[0])]
+    outdf['shrink_qty'] = [[] for i in range(ndf.shape[0])]
+    outdf['expand_qty'] = [[] for i in range(ndf.shape[0])]
+    pos = {}
+    for i in range(ndf.shape[0]):
+        ric = ndf['ric'].iloc[i]
+        sgn = ndf['sgn'].iloc[i]
+        qty = ndf['size'].iloc[i]
+        ts = ndf['ts'].iloc[i]
+        ymd = ndf['ymd'].iloc[i]
+
+        if ric not in pos:
+            pos[ric] = {'sgn': sgn, 'qty': qty, 'que': [[i, ts, ymd, qty]]}
+            outdf.iloc[i, 0] = 'expand'
+            continue
+        sympos = pos[ric]
+        if sympos['sgn'] == sgn:
+            outdf.iloc[i, 0] = 'exapnd'
+            sympos['qty'] += qty
+            sympos['que'].append([i, ts, ymd, qty])
+        else:
+            if qty <= sympos['qty']:
+                outdf.iloc[i, 0] = 'shrink'
+            else:
+                outdf.iloc[i, 0] = 'shrink/expand'
+
+            avail_size = qty
+            intraday = False
+            while avail_size > 0:
+                if sympos['qty'] == 0:
+                    if len(sympos['que']) > 0:
+                        print("!!! positon wrong, 0 position but non empty queue !!!")
+                    sympos['sgn'] = sgn
+                    sympos['qty'] = avail_size
+                    sympos['que'] = [[i, ts, ymd, avail_size]]
+                    break
+
+                o_i, o_ts, o_ymd, o_qty = sympos['que'][0]
+                if ymd > o_ymd:
+                    ht_days = ss[ymd] - ss[o_ymd]
+                    intraday = False
+                elif ymd == o_ymd:
+                    ht_minutes = (ts - o_ts).seconds / 60
+                    ht_days = 0
+                    intraday = True
+                else:
+                    intraday = None
+                    print("!!! trades in bad time order !!!")
+
+                ht_sz = np.nan
+                if o_qty > avail_size:
+                    sympos['que'][0][3] -= avail_size
+                    ht_sz = avail_size
+                    avail_size = 0
+                else:
+                    avail_size -= o_qty
+                    ht_sz = o_qty
+                    sympos['que'].pop(0)
+
+                if intraday:
+                    outdf.iloc[o_i, 1] += ht_sz
+                    outdf.iloc[o_i, 2] += ht_sz * ht_minutes
+                    outdf.iloc[i, 1] += ht_sz
+                    outdf.iloc[i, 2] += ht_sz * ht_minutes
+                else:
+                    outdf.iloc[o_i, 3] += ht_sz
+                    outdf.iloc[o_i, 4] += ht_sz * ht_days
+                    outdf.iloc[i, 3] += ht_sz
+                    outdf.iloc[i, 4] += ht_sz * ht_days
+                outdf.iloc[o_i, 5].append(i)
+                outdf.iloc[i, 6].append(o_i)
+                outdf.iloc[o_i, 7][ht_days] = outdf.iloc[o_i, 7].get(ht_days, 0) + ht_sz
+                outdf.iloc[i, 8][ht_days] = outdf.iloc[i, 8].get(ht_days, 0) + ht_sz
+                sympos['qty'] -= ht_sz
+
+            if sympos['qty'] == 0:
+                del pos[ric]
+
+    outdf['ht_day'] = outdf['crossday_ht'] / outdf['crossday_sz']
+    outdf['ht_min'] = outdf['intraday_ht'] / outdf['intraday_sz']
+    return outdf
+
+# HoldingDays tracker
+
+#
+
+# in this script, we have tools to reconcile production position with firm back office
+# we keep track of our sod_positions, trades and eod_positions
+
+import pandas as pd
+import numpy as np
+import Utils.PnLPosTracker as uppt
+import Utils.ApacDateTimeUtils as udt
+import Utils.AnalysisUtils as uda
+import Utils.Misc as um
+
+def reconcile_position(ymd):
+    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=False)
+    my_sod = pptracker.get_sod_position(ymd)
+    ishedge = pptracker.ishedge(my_sod.index.values)
+    my_sod.loc[ishedge, 'shares'] = my_sod.loc[ishedge, 'shares'] / 50
+    stk_sod = my_sod[(~ishedge) & (my_sod.index.values != 'cash')]
+
+    # reconcile with position fetched from back office position management sysmtem
+
+def check_pnl(st, en):
+    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=False)
+    stats = pptracker.gen_all_stats(st, en)
+    pptracker.change_currency(stats, fxrate=7.7501)
+    return stats
+
+def pre_open_run():
+    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=True)
+    self = pptracker
+    ymd = pd.Timestamp.today().strftime('%Y%m%d')
+    prev_ymd = udt.getPrevTradingDay(ymd, cc='HKG')
+    print(ymd)
+    pptracker.gen_eod_trd_pos(prev_ymd)
+    pptracker.gen_sod_position(ymd)
+
+    reconcile_position(ymd)
+
+    pnl = check_pnl('20200101', prev_ymd)
+
+def fix_all_run():
+    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=True)
+    self = pptracker
+    ymds = [dt.strftime('%Y%m%d') for dt in udt.getTraingDays('20200101', '20201231', cc='HKG')]
+    for i in range(1, len(ymds)):
+        ymd = ymds[i]
+        prev_ymd = ymds[i-1]
+        print(ymd)
+        pptracker.gen_eod_trd_pos(prev_ymd, clsprtype='local')
+        pptracker.gen_sod_position(ymd, currency='local')
+
+def toxicity_analysis():
+    N = 5   # markout days
+    ndf = pd.read_csv("D:/data/CRB/enriched_trades_file.csv")
+    ynames = ['sgn_ret_{}'.format(i) for i in range(N+1)]
+    qq = np.ones(ndf.shape[0]).astype(bool)
+
+    all = uda.summarize(ndf[qq], by=['one'], ynames=ynames, weight='absval')
+    byside = uda.summarize(ndf[qq], by=['side'], ynames=ynames, weight='absval')
+
+    # note that groupby can group by a lambda function, i used that to create groups
+    # on the fly, particularly for all sample
+    # aggregation function can also be lambda function
+    aggregations = {
+        'ordervalue': [len, 'sum'],
+        'executedvalue': ['sum'],
+        'qdone': [lambda x: 1.0 - (np.sum(x > 0) / len(x))]
+    }
+    ndf.groupby(lambda x: 'ALL').agg(aggregations)
+
+def get_barra_table(table_names=['barra_ids', 'close_prices', 'returns', 'volumns', 'adv30ds', 'mktcaps', 'betas'] ):
+    out = []
+    data_dir = 'D:/Data/refdata'
+    for tn in table_names:
+        out.append(pd.read_csv('{}/{}.csv'.format(data_dir, tn), index_col=0))
+    return out
+
+def get_hedged_return(brids, ymd, N, df_return, ret0=None, hdg_brid=None, hdg_ret0=None, beta=None):
+    dts = udt.getNTradingDays(ymd, N)
+    ymds = [dt.strftime('%Y%m%d') for dt in dts]
+    raw_ret = df_return.reindex(index=brids, columns=ymds).values * 0.01
+    if ret0 is not None:
+        raw_ret = np.column_stack((ret0, raw_ret))
+    raw_ret = pd.DataFrame((raw_ret + 1.0).cumprod(axis=1)-1.0, columns=['ret_{}'.format(i) for i in range(raw_ret.shape[1])])
+    if hdg_brid is not None:
+        hdg_ret = np.tile(df_return.reindex(index=[hdg_brid], columns=ymds).values * 0.01, (len(brids), 1))
+        if hdg_ret0 is not None:
+            hdg_ret = np.column_stack((hdg_ret0, hdg_ret))
+        hdg_ret = pd.DataFrame((hdg_ret+1.0).cumprod(axis=1)-1.0, columns=['hdg_ret_{}'.format(i) for i in range(hdg_ret.shape[1])])
+        if raw_ret.shape != hdg_ret.shape:
+            print("!!! raw and hdg return shape not the same!!!")
+        if beta is not None:
+            net_ret = raw_ret.values - beta[:, np.newaxis] * hdg_ret.values
+            net_ret = pd.DataFrame(net_ret, columns=['net_ret_{}'.format(i) for i in range(net_ret.shape[1])])
+        else:
+            print("!!! no beta is provided !!!")
+        return pd.concat([raw_ret, hdg_ret, net_ret], axis=1)
     else:
-        return dt64
+        return raw_ret
 
-def getPrevTradingDay(ymd, n=1, retfmt='%Y%m%d', cc='CHN'):
-    if n < 1:
-        print('n must be greater than or equal to 1')
-        return
-    bdays = getTraingDays(pd.to_datetime(ymd) + pd.Timedelta(days=int(n * 1.5) + 20),
-                          pd.to_datetime(ymd) + pd.Timedelta(days=1), cc=cc)
-    dt64 = bdays[-n]
-    if retfmt:
-        return dt64.strftime(retfmt)
-    else:
-        return dt64
+def summarize(ndf, by, ynames, weight, extra=['one', 'size']):
+    sumr1 = ndf.groupby(by)[extra+[weight]].sum()
+    sumr2 = ndf.groupby(by).apply(lambda x: x[ynames].apply(np.average, axis=0, weights=x[weight].values))
+    sumr3 = ndf.groupby(by).apply(lambda x: x[ynames].apply(stderr_ratioE, axis=0, weights=x[weight].values))
+    z = sumr2 / sumr3
+    mi1 = pd.MultiIndex.from_product([['sum'], ['N', 'shares', 'notional']]).to_list()
+    mi2 = pd.MultiIndex.from_product([['average', 'stderr', 'z_score'], ynames]).to_list()
+    mi = pd.MultiIndex.from_tuples(mi1 + mi2)
+    sumr = pd.concat([sumr1, sumr2, sumr3, z], axis=1)
+    sumr.columns = mi
+    return sumr
 
-# i need to improve this function, to add **kwarg type of parameters so we can pass more
-# argument to this function.
 
-def get_multi_day(st, en, func, cc='CHN', **kwargs):
-    tdfs = []
-    for dt in getTraingDays(st, en, cc=cc):
-        print(dt)
-        ymd = dt.strftime('%Y%m%d')
-        tmp_df = func(ymd, **kwargs)
-        tdfs.append(tmp_df)
-    df = pd.concat(tdfs, axis=0)
-    return df
 
-def hms2ssm(hms):
-    return functools.reduce(lambda acc, x: acc*60 + x, map(float, hms.split(':')))
 
-def ssm2hms(ssm):
-    h = ssm // 3600
-    r = ssm - h * 3600
-    m = r // 60
-    s = r - m * 60
-    return '{:02d}:{:02d}:{:02d}'.format(h, m, s)
 
-if __name__ == '__main__':
-    getTraingDays('20190101', '20190228')
+
+
+
+
+
+
 
