@@ -155,24 +155,72 @@ def intraday_toxicity_analysis():
 
 
 
-def stderr_ratioE(rets, weights):
-    n = len(rets)
-    if len(weights) != n:
-        print("rets and weights not equal length")
-        return np.nan
-    if n < 2:
-        print("stderr_ratioE: not enough samples")
-        return np.nan
-    x = weights
-    y = weights * rets
-    sx2 = x.var()
-    sy2 = y.var()
-    mx  = x.mean()
-    my  = y.mean()
-    r   = my / mx
-    pho = np.corrcoef(x, y)[0, 1]
-    rsd = np.sqrt((r**2 * sx2 + sy2 - 2 * r * pho * np.sqrt(sx2) * np.sqrt(sy2)) / (mx**2 *n))
-    return rsd
+import pandas as pd
+import numpy as np
+import Utils.DataAnalysisUtils as uda
+from sklearn import linear_model
+from sklearn.metrics import mean_squared_error
+from sklearn.model_selection import train_test_split
+
+# cross validation
+# for each day, use 3 month before's data to fit and predict on that day, you have 5 copies of
+# prediction for each, then compare the power for the prediction on all days
+# or we can predict on each month
+# for simplicity, here i only want to split into training and validation set to evaluate the power
+
+HLs = [1,2,5,10]
+N = 5
+
+def model_fit():
+    # get data, x, y names, training and validation data
+    df = pd.read_csv('D:/FrameWork/dataset/ho_imb.20200201.20201031.csv', index_col=0, converters={'ymd': str})
+    ynames = ['y_{}'.format(i) for i in range(N+1)]
+    clip_ynames = ['clip_y_{}'.format(i) for i in range(N+1)]
+    resid_ynames = ['clip_y_{}_resid'.format(i) for i in range(N+1)]
+    xnames = ['imb_resid'] + ['imb_{}_resid'.format(hl) for hl in HLs] + ['weighted_imb_{}_resid'.format(hl) for hl in HLs] \
+           + ['imb_srisk'] + ['imb_{}_srisk'.format(hl) for hl in HLs] + ['weighted_imb_{}_srisk'.format(hl) for hl in HLs]
+    yname = 'clip_y_2_resid'
+    nsym = df.ric.value_counts()
+    goodsym = nsym.index[nsym > 150]
+    ff = df.ric.isin(goodsym)
+
+    uda.ols_analysis(df[ff], xnames, ynames)
+
+    Z_all = df[ff]
+    Z_test = df[ff & (df.ymd >= '20201001')]
+    y_test = Z_test[yname]
+    Z_tv = df[ff & (df.ymd < '20201001') & (df.ymd > '20200131')]
+    y_tv = Z_tv[yname]
+    Z_train, Z_validation, y_train, y_validation = train_test_split(Z_tv, Z_tv[yname], test_size=0.3, random_state=123)
+
+    # Ridge
+    for alpha in [0, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10]:
+        clf = linear_model.Ridge(alpha=alpha, fit_intercept=False)
+        clf.fit(Z_train[xnames], y_train, sample_weight=1.0/(Z_train['dvol'] ** 2))
+        preds_train = clf.predict(Z_train[xnames])
+        preds_valid = clf.predict(Z_validation[xnames])
+        sc1 = clf.score(Z_train[xnames], y_train)
+        sc2 = clf.score(Z_validation[xnames], y_validation)
+        coef1 = np.corrcoef(y_train, preds_train)[0,1]
+        coef2 = np.corrcoef(y_validation, preds_valid)[0,1]
+        pw1 = uda.alpha_power(y_train, preds_train)
+        pw2 = uda.alpha_power(y_validation, preds_valid)
+        print('alpha={} Training Score = {} Test Score = {}'.format(alpha, sc1, sc2))
+        print('alpha={} Training Corr Coef = {} Test Corr Coef = {}'.format(alpha, coef1, coef2))
+        print('alpha={} Training Power = {} Test Power = {}'.format(alpha, pw1, pw2))
+        print('')
+    alpha = 1e-3  # pick from previous results
+    clf = linear_model.Ridge(alpha=alpha, fit_intercept=False)
+    clf.fit(Z_tv[xnames], y_tv, sample_weight=1.0 / (Z_train['dvol'] ** 2))
+    preds_test = clf.predict(Z_test[xnames])
+    score = clf.score(Z_test[xnames], y_test)
+    coef = np.corrcoef(preds_test, y_test)[0, 1]
+    pw = uda.alpha_power(preds_test, y_test)
+    print("Test score = {}, corrcoef = {}, power = {}".format(score, coef, pw))
+    for yname in resid_ynames:
+        print(uda.alpha_power(Z_test[yname], preds_test, w=1.0/Z_test['dvol']**2))
+
+
 
 
 
