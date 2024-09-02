@@ -1,230 +1,71 @@
-# HoldingDays tracker
-
-#
-
-# in this script, we have tools to reconcile production position with firm back office
-# we keep track of our sod_positions, trades and eod_positions
-
+import plotly.graph_objects as go
 import pandas as pd
-import numpy as np
-import Utils.PnLPosTracker as uppt
-import Utils.ApacDateTimeUtils as udt
-import Utils.AnalysisUtils as uda
-import Utils.Misc as um
+from ipywidgets import widgets, VBox
+from IPython.display import display
 
-def reconcile_position(ymd):
-    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=False)
-    my_sod = pptracker.get_sod_position(ymd)
-    ishedge = pptracker.ishedge(my_sod.index.values)
-    my_sod.loc[ishedge, 'shares'] = my_sod.loc[ishedge, 'shares'] / 50
-    stk_sod = my_sod[(~ishedge) & (my_sod.index.values != 'cash')]
+# Sample DataFrame
+df = pd.DataFrame({
+    'x': range(10),
+    'y': range(10)
+})
 
-    # reconcile with position fetched from back office position management sysmtem
+# Create a FigureWidget
+fig_widget = go.FigureWidget(data=[go.Scatter(x=df['x'], y=df['y'], mode='markers')])
 
-def check_pnl(st, en):
-    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=False)
-    stats = pptracker.gen_all_stats(st, en)
-    pptracker.change_currency(stats, fxrate=7.7501)
-    return stats
+# Create a slider widget
+slider = widgets.IntSlider(min=0, max=10, step=1, description='X Value')
 
-def pre_open_run():
-    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=True)
-    self = pptracker
-    ymd = pd.Timestamp.today().strftime('%Y%m%d')
-    prev_ymd = udt.getPrevTradingDay(ymd, cc='HKG')
-    print(ymd)
-    pptracker.gen_eod_trd_pos(prev_ymd)
-    pptracker.gen_sod_position(ymd)
+# Define a callback function to update the figure
+def update_plot(change):
+    fig_widget.data[0].x = df['x'][:change['new']]
+    fig_widget.data[0].y = df['y'][:change['new']]
 
-    reconcile_position(ymd)
+# Link the slider to the callback function
+slider.observe(update_plot, names='value')
 
-    pnl = check_pnl('20200101', prev_ymd)
+# Display the widgets and the figure
+display(VBox([slider, fig_widget]))
+from plotly.io import write_html
 
-def fix_all_run():
-    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='D:/Prod/CRB', loadsymap=True)
-    self = pptracker
-    ymds = [dt.strftime('%Y%m%d') for dt in udt.getTraingDays('20200101', '20201231', cc='HKG')]
-    for i in range(1, len(ymds)):
-        ymd = ymds[i]
-        prev_ymd = ymds[i-1]
-        print(ymd)
-        pptracker.gen_eod_trd_pos(prev_ymd, clsprtype='local')
-        pptracker.gen_sod_position(ymd, currency='local')
-
-def toxicity_analysis():
-    N = 5   # markout days
-    ndf = pd.read_csv("D:/data/CRB/enriched_trades_file.csv")
-    ynames = ['sgn_ret_{}'.format(i) for i in range(N+1)]
-    qq = np.ones(ndf.shape[0]).astype(bool)
-
-    all = uda.summarize(ndf[qq], by=['one'], ynames=ynames, weight='absval')
-    byside = uda.summarize(ndf[qq], by=['side'], ynames=ynames, weight='absval')
-
-    # note that groupby can group by a lambda function, i used that to create groups
-    # on the fly, particularly for all sample
-    # aggregation function can also be lambda function
-    aggregations = {
-        'ordervalue': [len, 'sum'],
-        'executedvalue': ['sum'],
-        'qdone': [lambda x: 1.0 - (np.sum(x > 0) / len(x))]
-    }
-    ndf.groupby(lambda x: 'ALL').agg(aggregations)
-
-def enrich_continuous_session(df, ymd, df_brids, df_clspr, df_returns, markto=5):
-    nxt_ymd = udt.getNextTradingDay(ymd, cc='HKG')
-    df['ts'] = pd.to_datetime(df['time'])
-    df['ymd'] = ymd
-    df['hms'] = df['time'].str.split(' ').str[1]
-    df = df[(df.hms < '16:01:00') & (df.hms > '09:30:00')].copy().sort_vlaues('time')
-    tdf = pd.read_csv('Y:/xli/data/tick/.HSI.{}.csv'.format(ymd), index_col=0)
-    tdf.index = pd.to_datetime(tdf['time'].str.split('+').str[0])
-    df['hdg_price'] = tdf['trpx'].asof(df.ts.values).values
-    df['hdg_clspr'] = tdf['trpx'].asof(pd.to_datetime(ymd + ' ' + '16:10:00'))
-    df['bbg'] = df.securityid.apply(um.ric2bbg)
-    df['brid'] = df_brids[ymd].reindex(df.bbg.values, fill_value='').values
-    df['clspr'] = df_clspr[ymd].reindex(df.brid.values).values
-    df['ret0'] = df['clspr'] / df['executionprice'] - 1.0
-    df['hdg_ret0'] = df['hdg_clspr'] / df['hdg_price'] - 1.0
-    ret_tbl = uda.get_hedged_return(df.brid.values, nxt_ymd, markto, df_returns, ret0=df.ret0.values,
-                                    hdg_brid='DA001974', hdg_ret0=df.hdg_ret0.values, beta=np.ones(df.shape[0]))
-    df = df.merge(ret_tbl.set_index(df.index.values), left_index=True, right_index=True)
-    return df
-
-def intraday_toxicity_analysis():
-    if False:
-        N = 1
-        df_brids, df_clspr, df_returns = uda.get_barra_table(table_names=['barra_ids', 'close_prices', 'returns'])
-        dfs = []
-        for dt in udt.getTraingDays('20210101', '20210407'):
-            print(dt)
-            ymd = dt.strftime('%Y%m%d')
-            df = feather.read_dataframe('Y:/xli/data/flowdb/t_HK_{}.ft'.format(ymd))
-            df = enrich_continuous_session(df, ymd, df_brids, df_clspr, df_returns, N)
-            dfs.append(df)
-        ndf = pd.concat(dfs, axis=0)
-
-    pptracker = uppt.QMM_PnLPosTracker(cc='HKG', country_issued_code='HK', save_dir='Y:/xli/Prod/QMM', loadsymap=False)
-    ndf['omm'] = ndf.securityid.isin(pptracker.omm)
-    ndf['tod'] = ((ndf.ts - pd.to_datetime(ndf.ts.dt.strftime('%Y%m%d'))).astype(np.int64) / 1e9 - 34200) // 1800
-    qmm_univ = pd.read_csv('D:/data/qmm_universe.csv')
-    ndf['univ'] = ndf.securityid.isin(qmm_univ.Symbol.values)
-    ndf['sgn'] = np.where(ndf.side == 'B', 1.0, -1.0)
-    ndf['size'] = ndf.cumulativequantity
-    ndf['one'] = 1
-    ndf['month'] = ndf.ymd.str[0:6]
-    ndf['absval'] = ndf.executionprice * ndf.cumulativequantity / 7.7501
-    ndf['fillside2'] = ''
-    f_far = ((ndf.side == 'B') & (ndf.executionprice >= ndf.apx1)) | ((ndf.side != 'B') & (ndf.executionprice <= ndf.bpx1))
-    f_near = ((ndf.side == 'B') & (ndf.executionprice <= ndf.bpx1)) | ((ndf.side != 'B') & (ndf.executionprice >= ndf.apx1))
-    ndf.loc[f_far, 'fillsdie2'] = 'far'
-    ndf.loc[f_near, 'fillside2'] = 'near'
-    ndf['cp'] = ndf.executiondesk
-    ndf.loc[ndf.crosstradingaccount == 'HFL', 'cp'] = 'QMM'
-    for i in range(N+1):
-        ndf['sgn_ret_{}'.format(i)] = ndf.sgn * ndf['net_ret_{}'.format(i)] * 10000.0
-    ynames = ['sgn_ret_{}'.format(i) for i in range(N+1)]
-
-    qq = (~ndf.net_ret_1.isnull()) & ndf.univ & (ndf.fillside2 == 'far')
-    q2 = ndf.account.isin(['DTG', 'HKI3', 'HKSM'])
-
-    uda.summarize(ndf[qq&q2], by=['account'], ynames=ynames, weight='absval')
-
-    max_position = 2e6
-    max_quote_size = 400e3
-    ndf['limit_absval'] = np.minimum(ndf.absval, max_quote_size)
-    sumr = ndf[qq&q2].groupby(['account', 'ymd', 'securityid']).apply(lambda x: x[ynames].apply(np.average, axis=0, weights=x['limit_absval'].values))
-    sumr['notional'] = np.minimum(ndf[qq&q2].groupby(['account', 'ymd', 'securityid'])['limit_absval'].sum(), max_position)
-    sumr = sumr.reset_index()
-    byaccountdate = sumr.groupby(['account', 'ymd']).apply(lambda x: x[ynames].apply(np.average, axis=0, weights=x['notional'].values))
-    byaccountdate['notional'] = sumr.groupby(['account', 'ymd'])['notional'].sum()
-
-    dtg = byaccountdate.xs('DTG')
-    dtg.index = pd.to_datetime(dtg.index)
-    dtg[['sgn_ret_{}'.format(i) for i in range(5)]].mul(dtg['notional']/1e4, axis=0).cumsum().plot()
-    dtg_bp = dtg[['sgn_ret_{}'.format(i) for i in range(5)]].mul(dtg['notional'], axis=0).cumsum().div(dtg['notional'].values)
-    dtg_bp[['sgn_ret_{}'.format(i) for i in range(5)]].plot(ylim=[-10, 50])
-
-    all = uda.summarize(ndf[qq&q2], by=['one'], ynames=ynames, weight='absval')
-    byacct = uda.summarize(ndf[qq & q2], by=['account'], ynames=ynames, weight='absval')
-    byacctid = uda.summarize(ndf[qq & q2], by=['account', 'clientid'], ynames=ynames, weight='absval')
-    byacctmon = uda.summarize(ndf[qq & q2], by=['account','month'], ynames=ynames, weight='absval')
-    byacctsym = uda.summarize(ndf[qq & q2], by=['account', 'securityid'], ynames=ynames, weight='absval')
-    byacctdate = uda.summarize(ndf[qq & q2], by=['account', 'ymd'], ynames=ynames, weight='absval')
+# Save the interactive plot as HTML
+write_html(fig_widget, file='interactive_plot.html', auto_open=True)
 
 
+# this program is used to check the completeness of data, find out missing days
+# fmtstr should include {0}, {1} {2}, {3}
 
+import os
+import sys
+import Utils.DateTimeUtils as dtu
 
-
-import pandas as pd
-import numpy as np
-import Utils.DataAnalysisUtils as uda
-from sklearn import linear_model
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-
-# cross validation
-# for each day, use 3 month before's data to fit and predict on that day, you have 5 copies of
-# prediction for each, then compare the power for the prediction on all days
-# or we can predict on each month
-# for simplicity, here i only want to split into training and validation set to evaluate the power
-
-HLs = [1,2,5,10]
-N = 5
-
-def model_fit():
-    # get data, x, y names, training and validation data
-    df = pd.read_csv('D:/FrameWork/dataset/ho_imb.20200201.20201031.csv', index_col=0, converters={'ymd': str})
-    ynames = ['y_{}'.format(i) for i in range(N+1)]
-    clip_ynames = ['clip_y_{}'.format(i) for i in range(N+1)]
-    resid_ynames = ['clip_y_{}_resid'.format(i) for i in range(N+1)]
-    xnames = ['imb_resid'] + ['imb_{}_resid'.format(hl) for hl in HLs] + ['weighted_imb_{}_resid'.format(hl) for hl in HLs] \
-           + ['imb_srisk'] + ['imb_{}_srisk'.format(hl) for hl in HLs] + ['weighted_imb_{}_srisk'.format(hl) for hl in HLs]
-    yname = 'clip_y_2_resid'
-    nsym = df.ric.value_counts()
-    goodsym = nsym.index[nsym > 150]
-    ff = df.ric.isin(goodsym)
-
-    uda.ols_analysis(df[ff], xnames, ynames)
-
-    Z_all = df[ff]
-    Z_test = df[ff & (df.ymd >= '20201001')]
-    y_test = Z_test[yname]
-    Z_tv = df[ff & (df.ymd < '20201001') & (df.ymd > '20200131')]
-    y_tv = Z_tv[yname]
-    Z_train, Z_validation, y_train, y_validation = train_test_split(Z_tv, Z_tv[yname], test_size=0.3, random_state=123)
-
-    # Ridge
-    for alpha in [0, 1e-4, 1e-3, 1e-2, 0.1, 1.0, 10]:
-        clf = linear_model.Ridge(alpha=alpha, fit_intercept=False)
-        clf.fit(Z_train[xnames], y_train, sample_weight=1.0/(Z_train['dvol'] ** 2))
-        preds_train = clf.predict(Z_train[xnames])
-        preds_valid = clf.predict(Z_validation[xnames])
-        sc1 = clf.score(Z_train[xnames], y_train)
-        sc2 = clf.score(Z_validation[xnames], y_validation)
-        coef1 = np.corrcoef(y_train, preds_train)[0,1]
-        coef2 = np.corrcoef(y_validation, preds_valid)[0,1]
-        pw1 = uda.alpha_power(y_train, preds_train)
-        pw2 = uda.alpha_power(y_validation, preds_valid)
-        print('alpha={} Training Score = {} Test Score = {}'.format(alpha, sc1, sc2))
-        print('alpha={} Training Corr Coef = {} Test Corr Coef = {}'.format(alpha, coef1, coef2))
-        print('alpha={} Training Power = {} Test Power = {}'.format(alpha, pw1, pw2))
-        print('')
-    alpha = 1e-3  # pick from previous results
-    clf = linear_model.Ridge(alpha=alpha, fit_intercept=False)
-    clf.fit(Z_tv[xnames], y_tv, sample_weight=1.0 / (Z_train['dvol'] ** 2))
-    preds_test = clf.predict(Z_test[xnames])
-    score = clf.score(Z_test[xnames], y_test)
-    coef = np.corrcoef(preds_test, y_test)[0, 1]
-    pw = uda.alpha_power(preds_test, y_test)
-    print("Test score = {}, corrcoef = {}, power = {}".format(score, coef, pw))
-    for yname in resid_ynames:
-        print(uda.alpha_power(Z_test[yname], preds_test, w=1.0/Z_test['dvol']**2))
-
-
-
-
-
-
-
-
-
+if __name__ == '__main__':
+    try:
+        __file__
+    except:
+        sys.argv = [sys.argv[0], 'W:/ChinaFutures/Data/raw/{0}.spt', '20160101', '20160331']
+    fmtstr = sys.argv[1]
+    st = sys.argv[2]
+    en = sys.argv[3]
+    for dt in dtu.getTradingDays(st, en):
+        ymd = dt.strftime('%Y%m%d')
+        y = ymd[0:4]
+        m = ymd[4:6]
+        d = ymd[6:8]
+        fn = fmtstr.format(ymd, y, m, d)
+        if not os.path.exists(fn):
+            print('{} : N/A'.format(fn))
+        else:
+            sz_bytes = os.stat(fn).st_size
+            if sz_bytes < 1024:
+                sz = sz_bytes
+                suffix = 'B'
+            elif sz_bytes < 1048576:
+                sz = sz_bytes / 1024
+                suffix = 'K'
+            elif sz_bytes < 1073741824:
+                sz = sz_bytes / 1048576
+                suffix = 'M'
+            else:
+                sz = sz_bytes / 1073741824
+                suffix = 'G'
+            print('{} : {:.2f}{}'.format(fn, sz, suffix))
